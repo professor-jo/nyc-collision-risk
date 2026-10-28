@@ -24,8 +24,6 @@ AWS CDK (Python) · Amazon S3 · AWS Budgets · pytest
 
 ### P0: Infrastructure foundation
 
-### P0: Infrastructure foundation
-
 I've implemented the following:
 
 - Set up a CDK Python project to define all infrastructure as code
