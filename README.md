@@ -24,22 +24,17 @@ AWS CDK (Python) · Amazon S3 · AWS Budgets · pytest
 
 ### P0: Infrastructure foundation
 
-**Infrastructure as code**
-- CDK Python project set up in `infra/`
+### P0: Infrastructure foundation
 
-**Data lake storage**
-- Three S3 buckets for the medallion layers: bronze (raw), silver (cleaned), gold (analysis-ready)
-- Block all public access
-- Encryption at rest with S3-managed keys (SSE-S3)
-- HTTPS required for all requests (encryption in transit)
-- Versioning on
-- Lifecycle rules: old object versions expire after 30 days; incomplete multipart uploads are removed after 7 days
-- Buckets are retained if the stack is deleted
-- Cost-allocation tags on every bucket (`project`, `sp`, `layer`)
+I've implemented the following:
 
-**Cost guardrail**
-- $5/month AWS Budget with an email alert
-- Alert email passed in at deploy time, never committed to the repo
-
-**Testing**
-- 10 unit tests (pytest + CDK assertions) on the synthesized CloudFormation template, covering buckets, security settings, tags and the budget
+- Set up a CDK Python project to define all infrastructure as code
+- Created three S3 buckets (bronze, silver, gold) for a medallion data lake
+- Blocked all public access to the buckets to prevent accidental data exposure
+- Encrypted data at rest with S3-managed keys and required HTTPS for encryption in transit
+- Enabled versioning to recover from accidental overwrites or deletes
+- Added lifecycle rules that expire old versions after 30 days and clean up failed uploads after 7 days, to control storage cost
+- Set buckets to be retained if the stack is deleted, so data is never lost by accident
+- Tagged every bucket with project and layer for cost tracking
+- Added a $5/month AWS Budget with an email alert as a cost guardrail, with the email passed in at deploy time so it's never committed
+- Wrote 10 CDK assertion unit tests to verify the security, retention, tagging and budget settings before anything is deployed
