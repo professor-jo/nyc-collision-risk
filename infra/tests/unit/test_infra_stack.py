@@ -47,6 +47,19 @@ def test_all_buckets_versioned(template):
         "VersioningConfiguration": {"Status": "Enabled"}
     })
 
+def test_all_buckets_have_lifecycle_rules(template):
+    template.all_resources_properties("AWS::S3::Bucket", {
+        "LifecycleConfiguration": {
+            "Rules": Match.array_with([
+                Match.object_like({
+                    "Status": "Enabled",
+                    "NoncurrentVersionExpiration": {"NoncurrentDays": 30},
+                    "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7},
+                })
+            ])
+        }
+    })
+
 def test_all_buckets_retained_on_delete(template):
     template.all_resources("AWS::S3::Bucket", {
         "DeletionPolicy": "Retain",
