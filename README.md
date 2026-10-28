@@ -37,4 +37,4 @@ I've implemented the following:
 - Set buckets to be retained if the stack is deleted, so data is never lost by accident
 - Tagged every bucket with project and layer for cost tracking
 - Added a $5/month AWS Budget with an email alert as a cost guardrail, with the email passed in at deploy time so it's never committed
-- Wrote 10 CDK assertion unit tests to verify the security, retention, tagging and budget settings before anything is deployed
+- Wrote 11 CDK assertion unit tests to verify the security, retention, tagging and budget settings before anything is deployed
