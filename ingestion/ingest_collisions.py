@@ -1,12 +1,22 @@
 """
 P1: Incremental Data Ingestion.
 
-Fetches collision records in batches, validates them (duplicate check),
-uploads raw JSON data to S3 Bronze, and updates a local watermark.
+Downloads new NYC car crash records and saves them to S3 (Bronze layer).
+"Incremental" means each run only grabs crashes it hasn't seen before.
 
-Uses (crash_date, collision_id) as a checkpoint.
-collision_id is an opaque hash, so crash_date gives the ordering and
-collision_id breaks ties between crashes on the same date.
+What one run does:
+    1. Read the watermark: a bookmark of the last crash we saved.
+    2. Ask the NYC Open Data API for crashes after that bookmark,
+       100 at a time (up to 500 per run).
+    3. Check the data: no duplicates, correct order, all actually new.
+    4. Upload the raw records to S3 as one JSON file.
+    5. Move the bookmark forward so the next run starts from here.
+
+How the bookmark works:
+    It stores two values: (crash_date, collision_id).
+    - crash_date puts crashes in time order.
+    - collision_id is a random-looking ID with no meaningful order,
+      so it's only used to tell apart crashes on the same date.
 
 Usage (run from the repo root so data/state/ resolves correctly):
     BRONZE_BUCKET=<bucket-name> python ingestion/ingest_collisions.py
@@ -205,7 +215,7 @@ def upload_to_s3(records, last_key):
 
 # Exponential Backoff
 # Increasing the delay between tries.
-# It is for the situations when the API fails to give data on requests.
+# It is for situations when the API fails to give data on requests.
 def create_session():
     """Create an HTTP session with automatic retries.
 
