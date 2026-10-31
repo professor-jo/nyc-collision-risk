@@ -2,6 +2,7 @@
 P1: Incremental Data Ingestion.
 
 Downloads new NYC car crash records and saves them to S3 (Bronze layer).
+
 "Incremental" means each run only grabs crashes it hasn't seen before.
 
 What one run does:
@@ -26,6 +27,8 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime, timezone
+import hashlib
+from botocore.exceptions import ClientError
 
 import boto3
 import requests
@@ -61,6 +64,9 @@ def load_watermark():
 
     The watermark marks the last record we already ingested.
     If no watermark file exists yet, start from INITIAL_WATERMARK.
+
+    Input:  none
+    Output: tuple[str, str] -> (crash_date, collision_id)
     """
 
     if WATERMARK_FILE.exists():
@@ -71,27 +77,50 @@ def load_watermark():
     return INITIAL_WATERMARK
 
 
-def save_watermark(watermark):
-    """Save the checkpoint after a successful upload.
 
-    The next run will pick up from this point, so records
-    are not fetched twice.
+def save_watermark(watermark):
+    """
+    Safely save the latest processed collision checkpoint.
+
+    Instead of writing directly to the original JSON file,
+    write to a temporary file and replace the original only
+    after the new checkpoint has been completely written.
     """
 
-    # Create the data/state/ folder if it doesn't exist yet
+    # Make sure the checkpoint directory exists.
     WATERMARK_FILE.parent.mkdir(
         parents=True,
         exist_ok=True
     )
 
-    with open(WATERMARK_FILE, "w") as file:
-        json.dump(
-            {
-                "last_crash_date": watermark[0],
-                "last_collision_id": watermark[1]
-            },
-            file
-        )
+    # Create a temporary file in the same directory.
+    # Example: ingestion_watermark.json.tmp
+    temp_file = WATERMARK_FILE.with_suffix(".json.tmp")
+
+    # Prepare the checkpoint values as a Python dictionary.
+    state = {
+        "last_crash_date": watermark[0],
+        "last_collision_id": watermark[1]
+    }
+
+    # Write the new checkpoint to the temporary file.
+    with open(temp_file, "w") as file:
+        json.dump(state, file, indent=2)
+
+        # Move Python's buffered data to the operating system.
+        file.flush()
+
+        # Ask the operating system to persist the file data.
+        os.fsync(file.fileno())
+
+    # Replace the original checkpoint with the completed file.
+    #
+    # If the process crashes before this operation,
+    # the previous checkpoint remains intact.
+    os.replace(temp_file, WATERMARK_FILE)
+
+    print("Watermark saved atomically.")
+
 
 
 def fetch_records(watermark):
@@ -99,6 +128,9 @@ def fetch_records(watermark):
 
     Asks the API only for records that come after the watermark,
     one batch at a time, and returns them all in one list.
+
+    Input:  watermark: tuple[str, str] -> (crash_date, collision_id)
+    Output: list[dict] -> raw collision records from the API
     """
     session = create_session()
 
@@ -148,10 +180,15 @@ def fetch_records(watermark):
 
 
 def validate_records(records, watermark):
-    """Validate uniqueness, ordering, and checkpoint of data.
+    """
+    Validate uniqueness, ordering, and checkpoint of data.
 
     Raises an error if anything looks wrong. Otherwise returns
     the key of the last record, which becomes the new watermark.
+
+    Input:  records: list[dict] -> raw collision records
+            watermark: tuple[str, str] -> (crash_date, collision_id)
+    Output: tuple[str, str] -> (crash_date, collision_id) of the newest record
     """
 
     # Build a (crash_date, collision_id) pair for each record
@@ -180,35 +217,91 @@ def validate_records(records, watermark):
     return keys[-1]
 
 
-def upload_to_s3(records, last_key):
-    """Upload raw collision records to Bronze S3.
 
-    Saves all records as one JSON file, organized into folders
-    by the date the ingestion ran.
+def upload_to_s3(records, last_key):
+    """Upload collision records to the S3 Bronze bucket.
+
+    *Applied idempotency
+
+    This function is IDEMPOTENT:
+    - If the batch doesn't exist, upload it
+    - If the identical batch exists, skip the upload
+    - If the same filename exists with different data, raise an error
+
+    This prevents accidental duplicate uploads when the pipeline
+    is rerun after a failure.
+
+    Input:  records: list[dict] -> raw collision records
+            last_key: tuple[str, str] -> (crash_date, collision_id) of the newest record
+    Output: None (uploads one JSON object to S3)
     """
 
+    # Create an S3 client using our AWS credentials
+    # boto3 is the Python library for interacting with AWS services
     s3 = boto3.client("s3")
 
+
+    # Get today's date in UTC, eg. "2026-10-31".
+    # We use this date to organize uploaded files into folders.
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # File path inside the bucket, e.g.
-    # collisions/ingestion_date=2026-10-31/collisions_2026-10-05_<id>.json
-    # ([:10] keeps just the YYYY-MM-DD part of the crash date)
+    # Define the location and filename of the JSON object inside S3.
     object_key = (
         f"collisions/ingestion_date={today}/"
         f"collisions_{last_key[0][:10]}_{last_key[1]}.json"
     )
 
-    # Convert the records to JSON text, then to bytes for upload
-    json_data = json.dumps(records).encode("utf-8")
+    # Convert the Python list of collision records into JSON bytes.
+    json_data = json.dumps(
+        records,
+        sort_keys=True,
+        separators=(",", ":")
+    ).encode("utf-8")
 
+    # Generate a fingerprint of the JSON contents
+    checksum = hashlib.sha256(json_data).hexdigest()
+
+    # Check whether this object already exists
+    # Before uploading, check whether an object with the same S3 bucket
+    # name and object key already exists.
+    try:
+        existing = s3.head_object(
+            Bucket=BUCKET_NAME,
+            Key=object_key
+        )
+    # If S3 returns an error, inspect what kind of error occurred.
+    except ClientError as error:
+        error_code = error.response["Error"]["Code"]
+        # Extract the AWS error code
+        if error_code not in ("404", "NoSuchKey", "NotFound"):
+            raise
+
+    # The else block runs ONLY if object with this key already exists.
+    else:
+        existing_checksum = existing.get(
+            "Metadata", {}
+        ).get("sha256")
+
+        if existing_checksum == checksum:
+            print("Identical batch already exists. Skipping upload.")
+            return
+
+        raise ValueError(
+            "S3 object already exists with different contents: "
+            f"s3://{BUCKET_NAME}/{object_key}"
+        )
+
+    # If execution reaches this point, the object does not exist.
+    # We can upload the new batch S3.
     s3.put_object(
         Bucket=BUCKET_NAME,
         Key=object_key,
         Body=json_data,
-        ContentType="application/json"
+        ContentType="application/json",
+        Metadata={"sha256": checksum},
+        IfNoneMatch="*"
     )
-
+    # This message appears only after a successful new upload.
     print(f"Uploaded to s3://{BUCKET_NAME}/{object_key}")
 
 
@@ -221,6 +314,9 @@ def create_session():
 
     Failed GET requests are retried up to 3 times, waiting
     longer before each retry (exponential backoff).
+
+    Input:  none
+    Output: requests.Session -> session with retry rules attached
     """
     retry_strategy = Retry(
         # Give up after 3 retries
@@ -249,6 +345,9 @@ def main():
 
     Steps: load checkpoint (starting datapoint) -> fetch new records (in batches) 
     -> validate -> upload to S3 -> save new checkpoint (will be used for future runs)
+
+    Input:  none
+    Output: None
     """
 
     watermark = load_watermark()
