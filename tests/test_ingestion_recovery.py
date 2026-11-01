@@ -1,10 +1,22 @@
 '''
 Tests that the ingestion pipeline is safe to re-run after a failure.
 
-- test_checkpoint_failure: if saving the watermark fails after the S3 upload,
-  the error is raised so the batch gets retried instead of skipped.
-- test_duplicate_upload_skipped: if the same batch is already in S3,
-  it is not uploaded again.
+
+Current data pipeline:
+
+    1. Load existing watermark
+    2. Fetch new records from API
+    3. Validate records
+    4. Check S3 (idempotency: if same batch exists / conflicting contents) and upload if needed.
+    5. Save the new watermark (only after S3 confirms the batch is stored)
+
+
+- test_checkpoint_failure: 
+    if saving the watermark fails after the S3 upload,
+    the error is raised so the batch gets retried instead of skipped.
+
+- test_duplicate_upload_skipped: 
+    if the same batch is already in S3, it is not uploaded again.
 
 S3, the API and the watermark are all mocked.
 '''

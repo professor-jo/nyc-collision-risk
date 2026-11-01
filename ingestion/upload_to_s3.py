@@ -5,14 +5,13 @@ from datetime import datetime,timezone
 import boto3
 import requests
 
+from ingestion.config import API_URL
+
 
 '''
 This script is to connect Python to AWS and upload the 10 sample
 NYC collision records (for now) to the Bronze S3 bucket using boto3.
 '''
-
-# NYC collision data API
-API_URL = "https://data.cityofnewyork.us/resource/h9gi-nx95.json"
 
 # Get the bronze bucket name from an environment variable
 BUCKET_NAME = os.environ["BRONZE_BUCKET"]

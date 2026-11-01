@@ -11,13 +11,8 @@ This way, it fetches only new data
 '''
 
 import requests
-# Define the API endpoint for NYC collision data
-API_URL = "https://data.cityofnewyork.us/resource/h9gi-nx95.json"
 
-# Define batch size (number of records to fetch per request)
-BATCH_SIZE = 100
-# Define the maximum number of records to fetch in total
-MAX_RECORDS = 500
+from ingestion.config import API_URL, BATCH_SIZE, MAX_RECORDS
 
 # Water mark file to keep track of the last processed crash_id
 WATERMARK_FILE = Path("data/state/collision_watermark.json")

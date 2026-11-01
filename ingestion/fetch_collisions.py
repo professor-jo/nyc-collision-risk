@@ -1,15 +1,13 @@
 import requests
 
+from ingestion.config import API_URL
+
 '''
 This script fetches the latest 100 collision records from the NYC Open Data API
 then prints the API status code and the first collision record to the console.
 
 It uses the requests library to make an HTTP GET request to the API endpoint.
 '''
-
-
-# Define the API endpoint for NYC collision data
-API_URL = "https://data.cityofnewyork.us/resource/h9gi-nx95.json"
 
 
 # Set query parameters to limit the number of records and order 

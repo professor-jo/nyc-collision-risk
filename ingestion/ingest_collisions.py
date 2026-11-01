@@ -19,13 +19,12 @@ How the bookmark works:
     - collision_id is a random-looking ID with no meaningful order,
       so it's only used to tell apart crashes on the same date.
 
-Usage (run from the repo root so data/state/ resolves correctly):
-    BRONZE_BUCKET=<bucket-name> python ingestion/ingest_collisions.py
+Usage (run from the repo root so the ingestion package resolves correctly):
+    BRONZE_BUCKET=<bucket-name> python -m ingestion.ingest_collisions
 """
 
 import json
 import os
-from pathlib import Path
 from datetime import datetime, timezone
 import hashlib
 from botocore.exceptions import ClientError
@@ -35,92 +34,13 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from ingestion.config import API_URL, BATCH_SIZE, MAX_RECORDS
+from ingestion.checkpoint import load_watermark, save_watermark
 
 # Configuration
-# NYC Open Data API endpoint for Motor Vehicle Collisions
-API_URL = "https://data.cityofnewyork.us/resource/h9gi-nx95.json"
-
-
-# How many records to request in a single API call
-BATCH_SIZE = 100
-# Upper limit on records collected in one run (keeps runs small)
-MAX_RECORDS = 500
-
 # Set S3 bucket for raw data, read from an environment variable
 # (the script fails immediately if BRONZE_BUCKET is not set)
 BUCKET_NAME = os.environ["BRONZE_BUCKET"]
-
-# Local file that remembers where the last run stopped
-# (kept separate from the checkpoint used in the earlier learning exercise)
-WATERMARK_FILE = Path("data/state/ingestion_watermark.json")
-
-# Starting point for the very first run, before any watermark file exists.
-# The empty collision_id means "every collision on this date counts as new".
-INITIAL_WATERMARK = ("2026-10-01T00:00:00.000", "")
-
-
-def load_watermark():
-    """Reads the last saved (crash_date, collision_id).
-
-    The watermark marks the last record we already ingested.
-    If no watermark file exists yet, start from INITIAL_WATERMARK.
-
-    Input:  none
-    Output: tuple[str, str] -> (crash_date, collision_id)
-    """
-
-    if WATERMARK_FILE.exists():
-        with open(WATERMARK_FILE, "r") as file:
-            state = json.load(file)
-            return (state["last_crash_date"], state["last_collision_id"])
-
-    return INITIAL_WATERMARK
-
-
-
-def save_watermark(watermark):
-    """
-    Safely save the latest processed collision checkpoint.
-
-    Instead of writing directly to the original JSON file,
-    write to a temporary file and replace the original only
-    after the new checkpoint has been completely written.
-    """
-
-    # Make sure the checkpoint directory exists.
-    WATERMARK_FILE.parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    # Create a temporary file in the same directory.
-    # Example: ingestion_watermark.json.tmp
-    temp_file = WATERMARK_FILE.with_suffix(".json.tmp")
-
-    # Prepare the checkpoint values as a Python dictionary.
-    state = {
-        "last_crash_date": watermark[0],
-        "last_collision_id": watermark[1]
-    }
-
-    # Write the new checkpoint to the temporary file.
-    with open(temp_file, "w") as file:
-        json.dump(state, file, indent=2)
-
-        # Move Python's buffered data to the operating system.
-        file.flush()
-
-        # Ask the operating system to persist the file data.
-        os.fsync(file.fileno())
-
-    # Replace the original checkpoint with the completed file.
-    #
-    # If the process crashes before this operation,
-    # the previous checkpoint remains intact.
-    os.replace(temp_file, WATERMARK_FILE)
-
-    print("Watermark saved atomically.")
-
 
 
 def fetch_records(watermark):
