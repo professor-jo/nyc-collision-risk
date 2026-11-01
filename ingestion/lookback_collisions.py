@@ -125,7 +125,7 @@ def upload_lookback_to_s3(records, start_date, end_date):
     print("Bucket:", bucket)
     print("Object key:", repr(object_key))
     print("AWS region:", s3.meta.region_name)
-    
+
     try:
         s3.head_object(
             Bucket=bucket,
@@ -181,3 +181,4 @@ if __name__ == "__main__":
 
     # Upload the fetched historical records to S3 Bronze
     upload_lookback_to_s3(records, start_date, end_date)
+    

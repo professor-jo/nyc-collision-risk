@@ -148,31 +148,3 @@ def test_duplicate_upload_skipped():
 
         # Confirm that no new upload was performed.
         mock_s3.put_object.assert_not_called()
-
-
-##########################################################################################
-
-def main():
-    # Step 1: Load the previous checkpoint
-    watermark = load_watermark()
-
-    # Step 2: Fetch records after that checkpoint
-    records = fetch_records(watermark)
-
-    # Step 3: Stop if no new records exist
-    if not records:
-        print("No new records found")
-        return
-
-    # Step 4: Validate records and determine new checkpoint
-    new_watermark = validate_records(records, watermark)
-
-    # Step 5: Upload data to S3 first
-    upload_to_s3(records, new_watermark)
-
-    # Step 6: Save checkpoint only after successful upload
-    save_watermark(new_watermark)
-
-
-if __name__ == "__main__":
-    main()
