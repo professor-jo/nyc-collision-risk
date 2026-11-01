@@ -58,7 +58,7 @@ def save_watermark(watermark):
 
     state = {
         "last_crash_date": watermark[0],
-        "last_crash_id": watermark[1]
+        "last_collision_id": watermark[1]
     }
 
     s3.put_object(

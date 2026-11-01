@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 data/
+lambda_package/
+aws-login.sh

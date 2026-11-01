@@ -1,18 +1,8 @@
 # Review notes for InfraStack
 #
-# Fix first:
-# - The ingestion Lambda is created inside the bucket loop, so the second pass
-#   reuses the "CollisionIngestionLambda" ID and synth should fail. Move the
-#   Lambda and its grant outside the loop.
-# - Code.from_asset("..") packages the whole parent directory with no excludes,
-#   which can include .git, virtualenvs, cdk.out, tests and .env files. Package
-#   only ingestion/, or add exclude patterns.
-#
 # Check before relying on it:
 # - Nothing in this stack invokes the Lambda. Add an EventBridge schedule if
 #   ingestion should be recurring.
-# - from_asset doesn't install dependencies. Anything the handler imports beyond
-#   the standard library and boto3 needs bundling or a layer.
 # - Reserved concurrency requires 100 concurrent executions to stay unreserved,
 #   so it can fail on a new account with a low quota.
 # - Nothing alerts on failed runs. Add a CloudWatch alarm on Lambda errors, and
@@ -91,15 +81,15 @@ class InfraStack(Stack):
             self,
             "CollisionIngestionLambda",
 
-            # Use Python 3.11 runtime
+            # Use Python 3.12 runtime
             runtime=lambda_.Runtime.PYTHON_3_12,
 
 
-            # Package the ingestion/ directory as a zip
+            # Package the prebuilt lambda_package/ directory as a zip
             code=lambda_.Code.from_asset("../lambda_package"),
 
             # Entry point for the Lambda
-            handler="ingestion.lambda_handler.lambda_hanlder",
+            handler="ingestion.lambda_handler.lambda_handler",
             timeout=Duration.minutes(5),
             memory_size=256,
             # Limit concurrent executions to 1

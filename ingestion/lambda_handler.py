@@ -1,6 +1,6 @@
 from ingestion.ingest_collisions import main
 
-def lambda_hanlder(event, context):
+def lambda_handler(event, context):
     '''
     Entry point called by AWS Lambda.
 
