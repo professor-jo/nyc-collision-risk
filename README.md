@@ -28,6 +28,12 @@ cd infra && cdk deploy -c budget_email=you@example.com
 
 Run the script yourself before running the infra tests on a fresh clone, since they need `lambda_package/` to exist.
 
+Ingestion stops with an error if its checkpoint is missing, so a new environment needs one created once, after the first deploy. This command refuses to overwrite an existing checkpoint:
+
+```bash
+BRONZE_BUCKET=<bucket-name> python -m ingestion.checkpoint
+```
+
 ---
 
 ## Progress log
