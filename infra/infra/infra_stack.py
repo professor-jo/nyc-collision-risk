@@ -19,6 +19,10 @@
 #   buckets in a dict instead.
 
 from aws_cdk import (
+    aws_cloudwatch as cloudwatch,
+    aws_logs as logs,
+    aws_sns as sns,
+    aws_sns_subscriptions as subscriptions,
     Duration,
     Stack,
     RemovalPolicy,
@@ -26,7 +30,11 @@ from aws_cdk import (
     aws_budgets as budgets,
     aws_s3 as s3,
     aws_lambda as lambda_,
+    aws_cloudwatch_actions as cw_actions,
+    aws_events as events,
+    aws_events_targets as targets,
 )
+
 from constructs import Construct
 
 class InfraStack(Stack):
@@ -80,6 +88,7 @@ class InfraStack(Stack):
         ingestion_lambda = lambda_.Function(
             self,
             "CollisionIngestionLambda",
+            log_retention=logs.RetentionDays.ONE_WEEK,
 
             # Use Python 3.12 runtime
             runtime=lambda_.Runtime.PYTHON_3_12,
@@ -93,9 +102,6 @@ class InfraStack(Stack):
             handler="ingestion.lambda_handler.lambda_handler",
             timeout=Duration.minutes(5),
             memory_size=256,
-            # Limit concurrent executions to 1
-            reserved_concurrent_executions=1,
-
             # Environment variable for the Bronze bucket name
             environment={
                 "BRONZE_BUCKET": bronze_bucket.bucket_name,
@@ -106,13 +112,54 @@ class InfraStack(Stack):
 
         bronze_bucket.grant_read_write(ingestion_lambda)
 
-        # Cost guardrail: email when monthly spend passes $5
+        error_alarm = cloudwatch.Alarm(
+            self,
+            "IngestionErrorAlarm",
+            metric=ingestion_lambda.metric_errors(
+                period=Duration.minutes(5)
+            ),
+            threshold=1,
+            evaluation_periods=1,
+            alarm_description="ANYC collision ingestion Lambda failed",
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        )
+
+        ingestion_rule = events.Rule(
+            self,
+            "DailyCollisionIngestion",
+            schedule=events.Schedule.cron(
+                minute="0",
+                hour="0",
+            ),
+            enabled=False,
+            description="Run NYC collision ingestion daily at 00:00 UTC",
+        )
+
+        ingestion_rule.add_target(
+            targets.LambdaFunction(ingestion_lambda)
+        )
+
+
+        # Email when monthly spend passes $5 and for ssubscription
         budget_email = self.node.try_get_context("budget_email")
         if not budget_email:
             raise ValueError(
                 "Missing context 'budget_email'. Pass it with: "
                 "cdk deploy -c budget_email=you@example.com"
             )
+
+        alert_topic = sns.Topic(
+            self,
+            "IngestionAlertTopic",
+        )
+
+        alert_topic.add_subscription(
+            subscriptions.EmailSubscription(budget_email)
+        )
+
+        error_alarm.add_alarm_action(
+            cw_actions.SnsAction(alert_topic)
+        )
 
         budgets.CfnBudget(
             self,
