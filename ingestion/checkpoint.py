@@ -34,7 +34,7 @@ def load_watermark():
     except ClientError as error:
         error_code = error.response["Error"]["Code"]
 
-        if error_code in ("NoSuchKey", "NotFound"):
+        if error_code in ("404", "NoSuchKey", "NotFound"):
             print("Checkpoint does not exist. Using initial watermark.")
             return INITIAL_WATERMARK
 
