@@ -18,6 +18,16 @@ AWS CDK (Python) · Amazon S3 · AWS Budgets · pytest
 |-------|-------|--------|
 | P0 | Infrastructure foundation | In progress |
 
+## Deploying
+
+`lambda_package/` is generated and not committed. The CDK CLI rebuilds it with `scripts/build_lambda_package.sh` before every synth, diff and deploy:
+
+```bash
+cd infra && cdk deploy -c budget_email=you@example.com
+```
+
+Run the script yourself before running the infra tests on a fresh clone, since they need `lambda_package/` to exist.
+
 ---
 
 ## Progress log

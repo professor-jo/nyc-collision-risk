@@ -85,7 +85,8 @@ class InfraStack(Stack):
             runtime=lambda_.Runtime.PYTHON_3_12,
 
 
-            # Package the prebuilt lambda_package/ directory as a zip
+            # Package lambda_package/ as a zip. It is generated and not in Git:
+            # the "build" command in cdk.json runs scripts/build_lambda_package.sh
             code=lambda_.Code.from_asset("../lambda_package"),
 
             # Entry point for the Lambda

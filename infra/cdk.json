@@ -1,5 +1,6 @@
 {
   "app": "python3 app.py",
+  "build": "../scripts/build_lambda_package.sh",
   "watch": {
     "include": [
       "**"
