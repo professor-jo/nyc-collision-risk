@@ -38,16 +38,16 @@ def test_checkpoint_failure():
     '''
 
     # Create a fake existing watermark
-    old_watermark = ("2026-10-05T00:00:00.000", "abc123")
+    old_watermark = ("2026-10-05T00:00:00.000", "fdbdc3a754bcb7538295548469bc4631")
 
     # Create a fake new watermark.
-    new_watermark = ("2026-10-06T00:00:00.000", "xyz789")
+    new_watermark = ("2026-10-06T00:00:00.000", "473b14600b6e9df374c28da7f9613c8a")
 
     # Create a small fake collision batch.
     records = [
         {
             "crash_date": "2026-10-06T00:00:00.000",
-            "collision_id": "xyz789"
+            "collision_id": "473b14600b6e9df374c28da7f9613c8a"
         }
     ]
 

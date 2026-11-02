@@ -12,10 +12,13 @@ This way, it fetches only new data
 
 import requests
 
-from ingestion.config import API_URL, BATCH_SIZE, MAX_RECORDS
+from ingestion.config import API_URL, BATCH_SIZE
 
 # Water mark file to keep track of the last processed crash_id
 WATERMARK_FILE = Path("data/state/collision_watermark.json")
+
+# Maximum number of records fetched per run
+MAX_RECORDS = 500
 
 
 # Load the last processed crash_id from the watermark file

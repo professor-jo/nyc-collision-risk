@@ -25,6 +25,7 @@ Usage (run from the repo root so the ingestion package resolves correctly):
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 import hashlib
 from botocore.exceptions import ClientError
@@ -34,7 +35,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from ingestion.config import API_URL, BATCH_SIZE, MAX_RECORDS
+from ingestion.config import API_URL, BATCH_SIZE, MAX_INGESTION_SECONDS
 from ingestion.checkpoint import load_watermark, save_watermark
 
 # Configuration
@@ -43,60 +44,41 @@ from ingestion.checkpoint import load_watermark, save_watermark
 BUCKET_NAME = os.environ["BRONZE_BUCKET"]
 
 
+
 def fetch_records(watermark):
-    """Fetch up to MAX_RECORDS using pagination.
+    """Fetch the next batch of collision records after the watermark.
 
-    Asks the API only for records that come after the watermark,
-    one batch at a time, and returns them all in one list.
-
-    Input:  watermark: tuple[str, str] -> (crash_date, collision_id)
-    Output: list[dict] -> raw collision records from the API
+    Input:  watermark: tuple[str, str]
+    Output: list[dict]
     """
     session = create_session()
 
     last_date, last_id = watermark
-    all_records = []
 
-    # offset = how many records to skip: 0, 100, 200, ...
-    for offset in range(0, MAX_RECORDS, BATCH_SIZE):
+    params = {
+        "$where": (
+            f"crash_date > '{last_date}' OR "
+            f"(crash_date = '{last_date}' "
+            f"AND collision_id > '{last_id}')"
+        ),
+        "$order": "crash_date ASC, collision_id ASC",
+        "$limit": BATCH_SIZE,
+    }
 
-        # Query parameters in the API's query language (SoQL)
-        params = {
-            # Only records newer than the watermark: a later date, or
-            # the same date with a larger collision_id
-            "$where": (
-                f"crash_date > '{last_date}' OR "
-                f"(crash_date = '{last_date}' "
-                f"AND collision_id > '{last_id}')"
-            ),
-            # A fixed sort order keeps pages from overlapping or skipping rows
-            "$order": "crash_date ASC, collision_id ASC",
-            "$limit": BATCH_SIZE,
-            "$offset": offset
-        }
-        # make a call to the server.
-        response = session.get(
-            API_URL,
-            params=params,
-            timeout=30
-        )
+    response = session.get(
+        API_URL,
+        params=params,
+        timeout=30,
+    )
 
-        # Stop with an error if the API returned a failure (e.g. 404, 500)
-        response.raise_for_status()
+    response.raise_for_status()
 
-        records = response.json()
-        all_records.extend(records)
+    records = response.json()
 
-        print(
-            f"Fetched {len(records)} records "
-            f"at offset {offset}"
-        )
+    print(f"Fetched {len(records)} records")
 
-        # A short batch means there's no more data to fetch (if data < 100 = batch size)
-        if len(records) < BATCH_SIZE:
-            break
+    return records
 
-    return all_records
 
 
 def validate_records(records, watermark):
@@ -117,6 +99,8 @@ def validate_records(records, watermark):
         for record in records
     ]
 
+
+
     collision_ids = [key[1] for key in keys]
 
     # Check 1: no collision appears twice
@@ -126,7 +110,6 @@ def validate_records(records, watermark):
     # Check 2: records arrived in the order we asked for
     if keys != sorted(keys):
         raise ValueError("Records are not sorted by crash_date, collision_id")
-
     # Check 3: every record is newer than the old watermark
     if not all(key > watermark for key in keys):
         raise ValueError("Records contain keys below the watermark")
@@ -260,39 +243,71 @@ def create_session():
     return session
 
 
-def main():
-    """Run the complete ingestion pipeline.
 
-    Steps: load checkpoint (starting datapoint) -> fetch new records (in batches) 
-    -> validate -> upload to S3 -> save new checkpoint (will be used for future runs)
+def main(context=None):
+    """Ingest collision records in batches within a time budget."""
 
-    Input:  none
-    Output: None
-    """
-
+    start_time = time.monotonic()
     watermark = load_watermark()
+
+    total_records = 0
+    batch_number = 0
 
     print(f"Starting watermark: {watermark}")
 
-    records = fetch_records(watermark)
+    while time.monotonic() - start_time < MAX_INGESTION_SECONDS:
 
-    # Nothing new since the last run, so there's nothing to do
-    if not records:
-        print("No new records found")
-        return
+        # Check how much execution time Lambda has left.
+        if context is not None:
+            remaining_seconds = (
+                context.get_remaining_time_in_millis() / 1000
+            )
 
-    new_watermark = validate_records(records, watermark)
+            # Stop before starting another batch if time is low.
+            if remaining_seconds < 60:
+                print(
+                    "Stopping ingestion: "
+                    f"only {remaining_seconds:.1f}s remaining"
+                )
+                break
 
-    # Persist data before advancing the checkpoint.
-    # If the upload fails, the watermark stays put and the
-    # next run retries the same records, so no data is lost.
-    upload_to_s3(records, new_watermark)
+        # Fetch the next 100 records after the current watermark.
+        records = fetch_records(watermark)
 
-    save_watermark(new_watermark)
+        # A short batch means we reached the current end of the API.
+        if not records:
+            print("No new records found")
+            break
 
-    print(f"Updated watermark: {new_watermark}")
-    print(f"Successfully ingested {len(records)} records")
+        # Validate before saving anything.
+        new_watermark = validate_records(records, watermark)
 
+        # Store the raw data before advancing the checkpoint.
+        upload_to_s3(records, new_watermark)
+
+        # Only advance the checkpoint after a successful upload.
+        save_watermark(new_watermark)
+
+        # Update our local progress for the next API request.
+        watermark = new_watermark
+        total_records += len(records)
+        batch_number += 1
+
+        print(
+            f"Batch {batch_number} completed: "
+            f"{len(records)} records"
+        )
+        print(f"Updated watermark: {watermark}")
+
+        # Fewer than 100 records means no more pages right now.
+        if len(records) < BATCH_SIZE:
+            print("Caught up with the API")
+            break
+
+    print(
+        f"Ingestion finished: {total_records} records "
+        f"across {batch_number} batches"
+    )
 
 # Run main() only when this file is executed directly,
 # not when it's imported by another module

@@ -33,6 +33,7 @@ from aws_cdk import (
     aws_cloudwatch_actions as cw_actions,
     aws_events as events,
     aws_events_targets as targets,
+    aws_dynamodb as dynamodb,
 )
 
 from constructs import Construct
@@ -110,8 +111,34 @@ class InfraStack(Stack):
             # Keep logs forever (default)
         )
 
+        # Grant Lambda access to S3
         bronze_bucket.grant_read_write(ingestion_lambda)
 
+        # Create DynamoDB lock table
+        # DynamoDB table is used to prevent overlapping ingestion runs (ran by lambda). The table has a single partition key "lock_id" and uses on-demand billing. The table is retained when the stack is deleted.
+        ingestion_lock_table = dynamodb.Table(
+            self,
+            "IngestionLockTable",
+            partition_key=dynamodb.Attribute(
+                name="lock_id",
+                type=dynamodb.AttributeType.STRING,
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+
+        # Allow Lambda to create, inspect, and release locks.
+        ingestion_lock_table.grant_read_write_data(ingestion_lambda)
+
+        # Tell Lambda which DynamoDB table stores ingestion locks.
+        ingestion_lambda.add_environment(
+            "INGESTION_LOCK_TABLE",
+            ingestion_lock_table.table_name,
+        )
+
+
+
+        # Cloudwatch monitoring part.
         error_alarm = cloudwatch.Alarm(
             self,
             "IngestionErrorAlarm",

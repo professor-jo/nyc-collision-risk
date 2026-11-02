@@ -1,6 +1,6 @@
 import requests
 
-from ingestion.config import API_URL, BATCH_SIZE, MAX_RECORDS
+from ingestion.config import API_URL, BATCH_SIZE
 
 '''
 This script fetches collision records from the NYC Open Data API
@@ -9,6 +9,9 @@ using PAGINATION to retrieve hundreds of records in number of batches.
 It fetches 100 records per batch, and continues until it reaches 500
 records meaning 5 batches in total.
 '''
+
+# Maximum number of records fetched per run
+MAX_RECORDS = 500
 
 # Collect all records in a list to store the fetched data
 all_records = []

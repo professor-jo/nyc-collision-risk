@@ -16,7 +16,7 @@ def lambda_handler(event, context):
 
     try:
         # Execute the existing NYC collision ingestion pipeline.
-        main()
+        main(context=context)
 
         return {
             "statusCode": 200,

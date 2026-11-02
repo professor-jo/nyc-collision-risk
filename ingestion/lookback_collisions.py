@@ -14,7 +14,7 @@ late-arriving records = records that were recorded aafter its actual date.
 
 from datetime import datetime, timedelta
 import requests
-from ingestion.config import API_URL, BATCH_SIZE, MAX_RECORDS
+from ingestion.config import API_URL, BATCH_SIZE
 import boto3
 import hashlib
 import json
