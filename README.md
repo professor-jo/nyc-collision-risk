@@ -34,6 +34,12 @@ Ingestion stops with an error if its checkpoint is missing, so a new environment
 BRONZE_BUCKET=<bucket-name> python -m ingestion.checkpoint
 ```
 
+## Late-arriving records
+
+NYC can publish a collision after the watermark has passed its crash date. So after each incremental run, the Lambda re-fetches the `LOOKBACK_DAYS` (14, in [`ingestion/config.py`](ingestion/config.py)) before the watermark, plus the watermark's own date, and stores them under `collisions/lookback/`.
+
+The lookback never moves the watermark, and it only uploads complete windows. If it runs short of time it uploads nothing and logs `LOOKBACK_STATUS=incomplete`, and the next run replays the whole window. An alarm fires if that happens three days in a row. Its window overlaps earlier ingestion, so bronze holds duplicates on purpose: Silver must deduplicate by `collision_id` and keep the row from the latest `ingestion_date`.
+
 ---
 
 ## Progress log

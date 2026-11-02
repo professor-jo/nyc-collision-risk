@@ -153,4 +153,41 @@ def test_fetch_records_uses_keyset_pagination():
     assert "collision_id > 'fdbdc3a754bcb7538295548469bc4631'" in params["$where"]
 
     mock_response.raise_for_status.assert_called_once()
-    
+
+
+def test_ingestion_stops_at_time_budget():
+    """Stop starting batches once MAX_INGESTION_SECONDS has passed."""
+
+    watermark = ("2026-10-02T00:00:00.000", "473b14600b6e9df374c28da7f9613c8a")
+    batch = [{"collision_id": f"{i:032x}"} for i in range(100)]
+
+    with (
+        patch.object(
+            ingest_collisions,
+            "load_watermark",
+            return_value=("2026-10-01T00:00:00.000", "fdbdc3a754bcb7538295548469bc4631"),
+        ),
+        patch.object(
+            ingest_collisions,
+            "fetch_records",
+            return_value=batch,
+        ) as mock_fetch,
+        patch.object(
+            ingest_collisions,
+            "validate_records",
+            return_value=watermark,
+        ),
+        patch.object(ingest_collisions, "upload_to_s3"),
+        patch.object(ingest_collisions, "save_watermark") as mock_save,
+        patch.object(
+            ingest_collisions.time,
+            "monotonic",
+            side_effect=[0, 0, ingest_collisions.MAX_INGESTION_SECONDS],
+        ),
+    ):
+        ingest_collisions.main()
+
+    # The first full batch finishes, and the next one never starts.
+    mock_fetch.assert_called_once()
+    mock_save.assert_called_once_with(watermark)
+

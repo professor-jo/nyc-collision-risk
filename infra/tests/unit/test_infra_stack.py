@@ -106,3 +106,18 @@ def test_monthly_budget_alerts_at_five_dollars(template):
             "Subscribers": [{"SubscriptionType": "EMAIL", "Address": "test@example.com"}],
         }],
     })
+
+
+def test_lookback_incomplete_alarm_needs_three_days_in_a_row(template):
+    # Must match the status text printed by ingestion/lookback_collisions.py.
+    template.has_resource_properties("AWS::Logs::MetricFilter", {
+        "FilterPattern": '"LOOKBACK_STATUS=incomplete"',
+    })
+    template.has_resource_properties("AWS::CloudWatch::Alarm", {
+        "MetricName": "LookbackIncomplete",
+        "Period": 86400,
+        "EvaluationPeriods": 3,
+        "Threshold": 1,
+        "TreatMissingData": "notBreaching",
+    })
+

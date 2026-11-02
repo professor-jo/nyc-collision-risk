@@ -45,22 +45,28 @@ BUCKET_NAME = os.environ["BRONZE_BUCKET"]
 
 
 
-def fetch_records(watermark):
+def fetch_records(watermark, end_date=None):
     """Fetch the next batch of collision records after the watermark.
 
     Input:  watermark: tuple[str, str]
+            end_date: str | None -> only return crash dates before this one
     Output: list[dict]
     """
     session = create_session()
 
     last_date, last_id = watermark
 
+    where = (
+        f"crash_date > '{last_date}' OR "
+        f"(crash_date = '{last_date}' "
+        f"AND collision_id > '{last_id}')"
+    )
+
+    if end_date is not None:
+        where = f"crash_date < '{end_date}' AND ({where})"
+
     params = {
-        "$where": (
-            f"crash_date > '{last_date}' OR "
-            f"(crash_date = '{last_date}' "
-            f"AND collision_id > '{last_id}')"
-        ),
+        "$where": where,
         "$order": "crash_date ASC, collision_id ASC",
         "$limit": BATCH_SIZE,
     }

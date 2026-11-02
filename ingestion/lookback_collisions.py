@@ -10,25 +10,30 @@ late-arriving records = records that were recorded aafter its actual date.
 3. We fetch the collision records on January 8th.
 4. This file will fetch late-arriving records recorded between Jan 1st ~ 7th
 5. Therefore late-arriving records also get recorded and won't get filtered out.
+
+The lookback only adds complete windows to S3 and never moves the watermark. The window
+overlaps earlier ingestion, so Silver must deduplicate by collision_id and keep
+the row from the latest ingestion_date.
 '''
 
-from datetime import datetime, timedelta
-import requests
-from ingestion.config import API_URL, BATCH_SIZE
+from datetime import datetime, timedelta, timezone
+from ingestion.config import BATCH_SIZE, LOOKBACK_DAYS
+from ingestion.checkpoint import load_watermark
+from ingestion.ingest_collisions import fetch_records, validate_records
 import boto3
 import hashlib
 import json
 import os
 from botocore.exceptions import ClientError
 
-def calculate_lookback_start(last_crash_date, days=7):
+def calculate_lookback_start(last_crash_date, days=LOOKBACK_DAYS):
     '''
     Calculate the start of a historical lookback window.
 
     Example:
         Last processed crash date = October 8th
-        Lookback period = 7 days
-        Lookback start = October 1st
+        Lookback period = 14 days
+        Lookback start = September 24th
     '''
 
     # Convert the timestamp string into a datetime object
@@ -43,45 +48,68 @@ def calculate_lookback_start(last_crash_date, days=7):
 
 
 
-def fetch_lookback_records(start_date, end_date):
+def calculate_lookback_end(last_crash_date):
+    '''
+    Calculate the exclusive end of the lookback window.
+
+    The window includes the watermark's own date, because a late record
+    on that date can sort below the watermark's collision_id.
+
+    Example:
+        Last processed crash date = October 8th
+        Lookback end = October 9th
+    '''
+
+    watermark_date = datetime.fromisoformat(last_crash_date)
+    lookback_end = watermark_date + timedelta(days=1)
+
+    return lookback_end.isoformat(timespec="milliseconds")
+
+
+
+
+def fetch_lookback_records(start_date, end_date, context=None):
     """
-    Fetch historical collisions within a date range,
-    using pagination until no more records remain.
+    Fetch all collisions within a date range, one batch at a time.
+
+    Pages through the range with its own local position, so the
+    ingestion watermark is neither read nor changed here.
+
+    Returns the records and whether the whole range was fetched.
     """
 
     all_records = []
-    offset = 0
+
+    # An empty collision_id sorts before every real ID.
+    position = (start_date, "")
 
     while True:
-        params = {
-            "$where": (
-                f"crash_date >= '{start_date}' "
-                f"AND crash_date < '{end_date}'"
-            ),
-            "$order": "crash_date ASC, collision_id ASC",
-            "$limit": BATCH_SIZE,
-            "$offset": offset
-        }
 
-        response = requests.get(
-            API_URL,
-            params=params,
-            timeout=30
-        )
+        # Stop before starting another batch if time is low.
+        if context is not None:
+            remaining_seconds = (
+                context.get_remaining_time_in_millis() / 1000
+            )
 
-        response.raise_for_status()
-        records = response.json()
+            if remaining_seconds < 60:
+                print(
+                    "Stopping lookback early: "
+                    f"only {remaining_seconds:.1f}s remaining"
+                )
+                return all_records, False
 
+        records = fetch_records(position, end_date=end_date)
+
+        if not records:
+            break
+
+        position = validate_records(records, position)
         all_records.extend(records)
-
-        print(f"Fetched {len(records)} records at offset {offset}")
 
         if len(records) < BATCH_SIZE:
             break
 
-        offset += BATCH_SIZE
-
-    return all_records
+    return all_records, True
 
 
 
@@ -114,8 +142,12 @@ def upload_lookback_to_s3(records, start_date, end_date):
     start_day = start_date[:10]
     end_day = end_date[:10]
 
+    # Silver uses ingestion_date to choose the latest version of a record.
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     object_key = (
         f"collisions/lookback/"
+        f"ingestion_date={today}/"
         f"start_date={start_day}/"
         f"end_date={end_day}/"
         f"batch_{checksum}.json"
@@ -158,27 +190,39 @@ def upload_lookback_to_s3(records, start_date, end_date):
     print(f"Uploaded {len(records)} records to S3.")
     print(f"S3 location: s3://{bucket}/{object_key}")
 
-############################## Running the script ##########################################
+def run_lookback(context=None):
+    '''
+    Re-fetch the window before the watermark and store it in S3 Bronze.
+    '''
 
-if __name__ == "__main__":
+    last_crash_date, _ = load_watermark()
 
-    last_crash_date = "2026-10-08T00:00:00.000"
+    start_date = calculate_lookback_start(last_crash_date)
+    end_date = calculate_lookback_end(last_crash_date)
 
-    start_date = calculate_lookback_start(
-        last_crash_date,
-        days=7
+    records, complete = fetch_lookback_records(
+        start_date,
+        end_date,
+        context=context,
     )
 
-    end_date = "2026-10-09T00:00:00.000"
+    print(f"Lookback window: {start_date} to {end_date}")
+    print(f"Fetched {len(records)} lookback records")
 
-    # Fetch historical records within the lookback window
-    records = fetch_lookback_records(start_date, end_date)
+    # Every lookback file is a complete window, so Silver never reads a
+    # partial snapshot. Nothing is saved here, so the next run replays it all.
+    if not complete:
+        # A CloudWatch alarm in InfraStack watches for this exact text.
+        print("LOOKBACK_STATUS=incomplete: nothing uploaded")
+        return
 
-    # Print the lookback window and the number of records fetched
-    print(f"Lookback start: {start_date}")
-    print(f"Lookback end: {end_date}")
-    print(f"Fetched {len(records)} records")
-
-    # Upload the fetched historical records to S3 Bronze
     upload_lookback_to_s3(records, start_date, end_date)
-    
+
+    print("LOOKBACK_STATUS=complete")
+
+
+############################## Running the script ##########################################
+
+# Run with: BRONZE_BUCKET=<bucket-name> python -m ingestion.lookback_collisions
+if __name__ == "__main__":
+    run_lookback()

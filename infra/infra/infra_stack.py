@@ -18,6 +18,8 @@
 # - Assigning bronze_bucket inside the loop relies on loop order. Store the
 #   buckets in a dict instead.
 
+from pathlib import Path
+
 from aws_cdk import (
     aws_cloudwatch as cloudwatch,
     aws_logs as logs,
@@ -37,6 +39,9 @@ from aws_cdk import (
 )
 
 from constructs import Construct
+
+# Resolved from this file, so the stack synthesizes from any working directory.
+LAMBDA_PACKAGE_DIR = Path(__file__).resolve().parents[2] / "lambda_package"
 
 class InfraStack(Stack):
 
@@ -97,7 +102,7 @@ class InfraStack(Stack):
 
             # Package lambda_package/ as a zip. It is generated and not in Git:
             # the "build" command in cdk.json runs scripts/build_lambda_package.sh
-            code=lambda_.Code.from_asset("../lambda_package"),
+            code=lambda_.Code.from_asset(str(LAMBDA_PACKAGE_DIR)),
 
             # Entry point for the Lambda
             handler="ingestion.lambda_handler.lambda_handler",
@@ -158,7 +163,7 @@ class InfraStack(Stack):
                 minute="0",
                 hour="0",
             ),
-            enabled=False,
+            enabled=True,
             description="Run NYC collision ingestion daily at 00:00 UTC",
         )
 
@@ -185,6 +190,35 @@ class InfraStack(Stack):
         )
 
         error_alarm.add_alarm_action(
+            cw_actions.SnsAction(alert_topic)
+        )
+
+        # A single incomplete lookback is harmless, since the next run replays
+        # it. Alert only when it stays incomplete three days in a row.
+        lookback_incomplete_filter = ingestion_lambda.log_group.add_metric_filter(
+            "LookbackIncompleteFilter",
+            filter_pattern=logs.FilterPattern.literal(
+                '"LOOKBACK_STATUS=incomplete"'
+            ),
+            metric_namespace="NycCollisionRisk",
+            metric_name="LookbackIncomplete",
+            metric_value="1",
+        )
+
+        lookback_incomplete_alarm = cloudwatch.Alarm(
+            self,
+            "LookbackIncompleteAlarm",
+            metric=lookback_incomplete_filter.metric(
+                period=Duration.days(1),
+                statistic="Sum",
+            ),
+            threshold=1,
+            evaluation_periods=3,
+            alarm_description="NYC collision lookback incomplete 3 days in a row",
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        )
+
+        lookback_incomplete_alarm.add_alarm_action(
             cw_actions.SnsAction(alert_topic)
         )
 

@@ -1,6 +1,7 @@
 
 from ingestion.ingest_collisions import main
 from ingestion.lock import acquire_lock, release_lock
+from ingestion.lookback_collisions import run_lookback
 
 
 def lambda_handler(event, context):
@@ -17,6 +18,10 @@ def lambda_handler(event, context):
     try:
         # Execute the existing NYC collision ingestion pipeline.
         main(context=context)
+
+        # Re-fetch recent dates for records published after the watermark
+        # passed them. This never moves the watermark.
+        run_lookback(context=context)
 
         return {
             "statusCode": 200,

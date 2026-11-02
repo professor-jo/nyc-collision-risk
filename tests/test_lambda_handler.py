@@ -1,6 +1,6 @@
 
 import pytest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 from ingestion.lambda_handler import lambda_handler
 
@@ -14,43 +14,85 @@ test_existing_lock tests if
     - Skip ingestion when lock is held
 test_ingestion_failure tests if
     - test_Release lock even when ingestion fails
+test_lookback_failure tests if
+    - Release lock and report the failure when the lookback fails
 
 '''
 
 @patch("ingestion.lambda_handler.release_lock")
+@patch("ingestion.lambda_handler.run_lookback")
 @patch("ingestion.lambda_handler.main")
 @patch("ingestion.lambda_handler.acquire_lock")
-def test_successful_ingestion(mock_acquire, mock_main, mock_release):
+def test_successful_ingestion(mock_acquire, mock_main, mock_lookback, mock_release):
     mock_acquire.return_value = "owner-123"
 
     result = lambda_handler({}, None)
 
     assert result["statusCode"] == 200
     mock_main.assert_called_once()
+    mock_lookback.assert_called_once()
     mock_release.assert_called_once_with("owner-123")
 
 
 @patch("ingestion.lambda_handler.release_lock")
+@patch("ingestion.lambda_handler.run_lookback")
 @patch("ingestion.lambda_handler.main")
 @patch("ingestion.lambda_handler.acquire_lock")
-def test_existing_lock(mock_acquire, mock_main, mock_release):
+def test_existing_lock(mock_acquire, mock_main, mock_lookback, mock_release):
     mock_acquire.return_value = None
 
     result = lambda_handler({}, None)
 
     assert result["statusCode"] == 409
     mock_main.assert_not_called()
+    mock_lookback.assert_not_called()
     mock_release.assert_not_called()
 
 
 @patch("ingestion.lambda_handler.release_lock")
+@patch("ingestion.lambda_handler.run_lookback")
 @patch("ingestion.lambda_handler.main")
 @patch("ingestion.lambda_handler.acquire_lock")
-def test_ingestion_failure(mock_acquire, mock_main, mock_release):
+def test_ingestion_failure(mock_acquire, mock_main, mock_lookback, mock_release):
     mock_acquire.return_value = "owner-123"
     mock_main.side_effect = RuntimeError("API failure")
 
     with pytest.raises(RuntimeError, match="API failure"):
         lambda_handler({}, None)
 
+    mock_lookback.assert_not_called()
     mock_release.assert_called_once_with("owner-123")
+
+
+@patch("ingestion.lambda_handler.release_lock")
+@patch("ingestion.lambda_handler.run_lookback")
+@patch("ingestion.lambda_handler.main")
+@patch("ingestion.lambda_handler.acquire_lock")
+def test_lookback_failure(mock_acquire, mock_main, mock_lookback, mock_release):
+    mock_acquire.return_value = "owner-123"
+    mock_lookback.side_effect = RuntimeError("API failure")
+
+    with pytest.raises(RuntimeError, match="API failure"):
+        lambda_handler({}, None)
+
+    mock_release.assert_called_once_with("owner-123")
+
+
+@patch("ingestion.lambda_handler.release_lock")
+@patch("ingestion.lambda_handler.run_lookback")
+@patch("ingestion.lambda_handler.main")
+@patch("ingestion.lambda_handler.acquire_lock")
+def test_incremental_runs_before_lookback(mock_acquire, mock_main, mock_lookback, mock_release):
+    mock_acquire.return_value = "owner-123"
+
+    steps = Mock()
+    steps.attach_mock(mock_main, "main")
+    steps.attach_mock(mock_lookback, "lookback")
+    context = Mock()
+
+    lambda_handler({}, context)
+
+    assert steps.mock_calls == [
+        call.main(context=context),
+        call.lookback(context=context),
+    ]
