@@ -8,7 +8,7 @@ Downloads new NYC car crash records and saves them to S3 (Bronze layer).
 What one run does:
     1. Read the watermark: a bookmark of the last crash we saved.
     2. Ask the NYC Open Data API for crashes after that bookmark,
-       100 at a time (up to 500 per run).
+       100 at a time, until caught up or out of time.
     3. Check the data: no duplicates, correct order, all actually new.
     4. Upload the raw records to S3 as one JSON file.
     5. Move the bookmark forward so the next run starts from here.

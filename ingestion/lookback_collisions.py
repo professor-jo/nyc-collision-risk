@@ -12,8 +12,8 @@ late-arriving records = records that were recorded aafter its actual date.
 5. Therefore late-arriving records also get recorded and won't get filtered out.
 
 The lookback only adds complete windows to S3 and never moves the watermark. The window
-overlaps earlier ingestion, so Silver must deduplicate by collision_id and keep
-the row from the latest ingestion_date.
+overlaps earlier ingestion, so Silver must deduplicate by collision_id. The README
+documents which row to keep.
 '''
 
 from datetime import datetime, timedelta, timezone

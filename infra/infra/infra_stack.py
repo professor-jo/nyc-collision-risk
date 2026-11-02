@@ -194,7 +194,9 @@ class InfraStack(Stack):
         )
 
         # A single incomplete lookback is harmless, since the next run replays
-        # it. Alert only when it stays incomplete three days in a row.
+        # it. Alert only on three consecutive UTC days that each logged an
+        # incomplete lookback. Any day without one, for any reason, resets the
+        # count: see "Late-arriving records" in the README for what this misses.
         lookback_incomplete_filter = ingestion_lambda.log_group.add_metric_filter(
             "LookbackIncompleteFilter",
             filter_pattern=logs.FilterPattern.literal(
