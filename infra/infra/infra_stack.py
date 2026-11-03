@@ -137,6 +137,34 @@ class InfraStack(Stack):
             prune=False,
         )
 
+        silver_job = glue.CfnJob(
+            self,
+            "SilverCollisionsJob",
+            name="nyc-collision-silver-etl",
+            # Uses our previously deployed IAM role
+            role=glue_role.role_arn,
+            command=glue.CfnJob.JobCommandProperty(
+                # Runs an Apache Spark ETL job
+                name="glueetl",
+                python_version="3",
+                script_location=(
+                    f"s3://{silver_bucket.bucket_name}/"
+                    "glue/scripts/silver_collisions.py"
+                ),
+            ),
+            glue_version="5.0",
+            # Specifies the Glue worker type
+            worker_type="G.1X",
+            # Using small worker configuration
+            number_of_workers=2,
+            # Stops the job after 10 minutes to limit costs
+            timeout=10,
+            # Prevents automatic reruns during development.
+            max_retries=0,
+        )
+
+        # Ensure the script is uploaded before the job is created
+        silver_job.node.add_dependency(glue_script_deployment)
 
         # Read raw collision data from Bronze
         bronze_bucket.grant_read(glue_role)
