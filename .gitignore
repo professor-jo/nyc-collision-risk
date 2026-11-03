@@ -1,5 +1,32 @@
+# Python
 __pycache__/
 *.pyc
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local data
 data/
+
+# AWS CDK generated files
+cdk.out/
 lambda_package/
+
+# Local credentials and environment variables
+.env
+.env.*
+!.env.example
 aws-login.sh
+
+# Temporary execution outputs
+response.json
+*-response.json
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

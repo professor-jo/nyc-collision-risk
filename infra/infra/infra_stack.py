@@ -1,22 +1,17 @@
-# Review notes for InfraStack
+# InfraStack — NYC Collision Risk Pipeline
 #
-# Check before relying on it:
-# - Nothing in this stack invokes the Lambda. Add an EventBridge schedule if
-#   ingestion should be recurring.
-# - Reserved concurrency requires 100 concurrent executions to stay unreserved,
-#   so it can fail on a new account with a low quota.
-# - Nothing alerts on failed runs. Add a CloudWatch alarm on Lambda errors, and
-#   consider a dead-letter queue if invocations will be async.
+# P1 infrastructure:
+# - S3 buckets for Bronze, Silver, and Gold data layers
+# - Lambda for incremental and rolling-lookback ingestion
+# - EventBridge for daily scheduled ingestion
+# - DynamoDB for ingestion concurrency locking
+# - CloudWatch alarms and SNS email notifications
+# - AWS Budgets for cost monitoring
 #
-# Worth improving:
-# - The budget alert only fires after spend passes $5. Add a forecasted alert or
-#   a lower threshold.
-# - The budget has no cost filter, so it tracks the whole AWS account.
-# - Only the buckets are tagged. Use Tags.of(self) for project and sp, and keep
-#   layer on each bucket.
-# - Lambda logs are kept forever by default. Set a retention period.
-# - Assigning bronze_bucket inside the loop relies on loop order. Store the
-#   buckets in a dict instead.
+# Operational considerations:
+# - Monitor Lambda execution duration and API retry behavior.
+# - Monitor incomplete lookback executions.
+# - Review AWS costs and service quotas periodically.
 
 from pathlib import Path
 
@@ -36,12 +31,19 @@ from aws_cdk import (
     aws_events as events,
     aws_events_targets as targets,
     aws_dynamodb as dynamodb,
+    aws_iam as iam,
+    aws_glue as glue,
+    aws_s3_deployment as s3delpoy,
 )
 
 from constructs import Construct
 
 # Resolved from this file, so the stack synthesizes from any working directory.
 LAMBDA_PACKAGE_DIR = Path(__file__).resolve().parents[2] / "lambda_package"
+
+# CDK needs to know where local PySpark script lives so we can upload it to S3 for
+# Glue to execute
+GLUE_SCRIPT_DIR = Path(__file__).resolve().parents[2] / "glue"
 
 class InfraStack(Stack):
 
@@ -85,10 +87,63 @@ class InfraStack(Stack):
 
             if layer == "bronze":
                 bronze_bucket = bucket
+
+
+            if layer == "bronze":
+                bronze_bucket = bucket
+            elif layer == "silver":
+                silver_bucket = bucket
+
+
+            
             # Tag resources for cost tracking
             Tags.of(bucket).add("project", "nyc-risk")
             Tags.of(bucket).add("sp", "SP0")
             Tags.of(bucket).add("layer", layer)
+
+
+        # IAM role assumed by AWS Glue jobs
+        glue_role = iam.Role(
+            self,
+            "CollisionGlueRole",
+            assumed_by=iam.ServicePrincipal("glue.amazonaws.com"),
+        )
+
+        # Basic Glue permissions, including CloudWatch logging
+        glue_role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name(
+                "service-role/AWSGlueServiceRole"
+            )
+        )
+
+        # Register the lakehouse database in Glue Data Catalog
+        lakehouse_database = glue.CfnDatabase(
+            self,
+            "CollisionLakehouseDatabase",
+            catalog_id=self.account,
+            database_input=glue.CfnDatabase.DatabaseInputProperty(
+                name="nyc_collision_lakehouse",
+                description="Metadata catalog for NYC collision lakehouse tables",
+            ),
+        )
+
+        # Upload local Glue scripts to the Silver S3 bucket
+        glue_script_deployment = s3deploy.BucketDeployment(
+            self,
+            "GlueScriptDeployment",
+            sources=[s3deeploy.Source.asset(str(GLUE_SCRIPT_DIR))],
+            destination_bucket=silver_bucket,
+            destination_key_prefix="glue/scripts",
+            prune=False,
+        )
+
+
+        # Read raw collision data from Bronze
+        bronze_bucket.grant_read(glue_role)
+
+        # Write transformed data to Silver
+        silver_bucket.grant_read_write(glue_role)
+
 
         # Create Lambda
         ingestion_lambda = lambda_.Function(
@@ -194,9 +249,7 @@ class InfraStack(Stack):
         )
 
         # A single incomplete lookback is harmless, since the next run replays
-        # it. Alert only on three consecutive UTC days that each logged an
-        # incomplete lookback. Any day without one, for any reason, resets the
-        # count: see "Late-arriving records" in the README for what this misses.
+        # it. Alert only when it stays incomplete three days in a row.
         lookback_incomplete_filter = ingestion_lambda.log_group.add_metric_filter(
             "LookbackIncompleteFilter",
             filter_pattern=logs.FilterPattern.literal(
