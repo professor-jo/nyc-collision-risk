@@ -2,7 +2,8 @@
 Silver ETL for NYC collision data.
 
 Reads raw Bronze JSON, converts columns to analytical data types, derives
-temporal columns, and prints validation, data quality and duplicate results.
+temporal columns, applies data quality checks, and keeps the latest record
+for each collision.
 '''
 
 import sys
@@ -14,19 +15,19 @@ from pyspark.sql.functions import (
     coalesce,
     col,
     concat_ws,
-    count,
     dayofweek,
     hour,
     input_file_name,
     lit,
     month,
-    sum as spark_sum,
-    to_date,
-    to_timestamp,
-    trim,
-    when,
     regexp_extract,
     row_number,
+    sha2,
+    struct,
+    to_date,
+    to_json,
+    to_timestamp,
+    trim,
 )
 
 # Read arguments passed from the Glue job configuration
@@ -53,24 +54,6 @@ df = (
 # Track the source file for each record
 df = df.withColumn("source_file", input_file_name())
 
-# Inspect the data
-print("=== BRONZE DATA PROFILE ===")
-print(f"Total records: {df.count()}")
-print(f"Total columns: {len(df.columns)}")
-
-df.printSchema()
-
-# Showing first 5 rows of which columns, of dataframe.
-df.select(
-    "collision_id",
-    "crash_date",
-    "crash_time",
-    "latitude",
-    "longitude",
-    "source_file",
-).show(5, truncate=False)
-
-
 # Convert raw string columns into analytical data types
 silver_df = (
     df
@@ -88,62 +71,6 @@ silver_df = (
     .withColumn("crash_day_of_week", dayofweek(col("crash_date")))
     .withColumn("crash_month", month(col("crash_date")))
 )
-
-print("=== SILVER TRANSFORMATION PREVIEW ===")
-
-silver_df.select(
-    "collision_id",
-    "crash_date",
-    "crash_timestamp",
-    "crash_hour",
-    "crash_day_of_week",
-    "latitude",
-    "longitude",
-).show(10, truncate=False)
-
-silver_df.printSchema()
-
-print("=== SILVER VALIDATION ===")
-
-df.select(
-    count("*").alias("total_rows"),
-    count("crash_date").alias("raw_crash_date"),
-    count("crash_time").alias("raw_crash_time"),
-    count("latitude").alias("raw_latitude"),
-    count("longitude").alias("raw_longitude"),
-).show(truncate=False)
-
-silver_df.select(
-    count("crash_date").alias("crash_date"),
-    count("latitude").alias("latitude"),
-    count("longitude").alias("longitude"),
-    count("crash_timestamp").alias("crash_timestamp"),
-    count("crash_hour").alias("crash_hour"),
-    count("crash_day_of_week").alias("crash_day_of_week"),
-    count("crash_month").alias("crash_month"),
-).show(truncate=False)
-
-
-print("=== CONVERSION FAILURES ===")
-
-silver_df.select(
-    spark_sum(
-        when(
-            col("crash_time").isNotNull()
-            & col("crash_timestamp").isNull(),
-            1,
-        ).otherwise(0)
-    ).alias("timestamp_failures"),
-
-    spark_sum(
-        when(
-            col("crash_date").isNotNull()
-            & col("crash_month").isNull(),
-            1,
-        ).otherwise(0)
-    ).alias("month_failures"),
-).show(truncate=False)
-
 
 # All injury and fatality columns
 count_columns = [
@@ -216,10 +143,8 @@ critical_error = (
 
 # A collision can still be useful for temporal and
 # severity analysis without usable coordinates.
-
 valid_df = silver_df.filter(~critical_error)
 quarantine_df = silver_df.filter(critical_error)
-
 
 valid_count = valid_df.count()
 unique_id_count = valid_df.select("collision_id").distinct().count()
@@ -241,5 +166,96 @@ print("=== DUPLICATE ANALYSIS ===")
 
 print("Unique collision IDs:", unique_id_count)
 print("Duplicate occurrences:", valid_count - unique_id_count)
+
+# Extracting ingestion date from the S3 file path.
+valid_df = valid_df.withColumn(
+    "ingestion_date",
+    # Converts extracted text into a Spark date.
+    to_date(
+        # regexp_extract() searches the S3 path for ingestion date.
+        regexp_extract(
+            col("source_file"),
+            r"ingestion_date=(\d{4}-\d{2}-\d{2})",
+            1,
+        ),
+        "yyyy-MM-dd",
+    )
+)
+
+print("=== INGESTION DATE COVERAGE ===")
+
+valid_df.groupBy(
+    col("ingestion_date").isNull().alias("missing_ingestion_date")
+).count().show()
+
+# Create a reproducible hash from each record's content.
+# This helps break ties between different versions
+# stored in the same source file.
+hash_columns = sorted(valid_df.columns)
+
+valid_df = valid_df.withColumn(
+    "record_hash",
+    sha2(
+        to_json(
+            struct(*[col(name) for name in hash_columns])
+        ),
+        256,
+    ),
+)
+
+# Define the ordering within each collision ID.
+window_spec = (
+    Window
+    .partitionBy("collision_id")
+    .orderBy(
+        col("ingestion_date").desc_nulls_last(),
+        col("source_file").desc(),
+        col("record_hash").desc(),
+    )
+)
+
+# Assign a rank to every version of each collision.
+ranked_df = valid_df.withColumn(
+    "row_num",
+    row_number().over(window_spec)
+)
+
+# Keep only the first record for each collision.
+deduplicated_df = (
+    ranked_df
+    .filter(col("row_num") == 1)
+    .drop("row_num", "record_hash")
+)
+
+after_count = deduplicated_df.count()
+
+remaining_duplicates = (
+    after_count
+    - deduplicated_df.select("collision_id").distinct().count()
+)
+
+print("=== P2.6 DEDUPLICATION RESULTS ===")
+
+print("Records before:", valid_count)
+print("Records after:", after_count)
+print("Records removed:", valid_count - after_count)
+print("Duplicate IDs remaining:", remaining_duplicates)
+
+print("=== INGESTION DATE DISTRIBUTION ===")
+
+deduplicated_df.groupBy(
+    "ingestion_date"
+).count().orderBy(
+    col("ingestion_date").desc_nulls_last()
+).show(20, truncate=False)
+
+# Fail the job if deduplication does not meet expectations.
+assert after_count == unique_id_count, (
+    "Deduplicated count does not match unique collision count"
+)
+
+assert remaining_duplicates == 0, (
+    "Duplicate collision IDs remain"
+)
 
 spark.stop()
