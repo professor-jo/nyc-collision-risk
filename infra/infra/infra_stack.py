@@ -33,7 +33,7 @@ from aws_cdk import (
     aws_dynamodb as dynamodb,
     aws_iam as iam,
     aws_glue as glue,
-    aws_s3_deployment as s3delpoy,
+    aws_s3_deployment as s3deploy
 )
 
 from constructs import Construct
@@ -88,9 +88,6 @@ class InfraStack(Stack):
             if layer == "bronze":
                 bronze_bucket = bucket
 
-
-            if layer == "bronze":
-                bronze_bucket = bucket
             elif layer == "silver":
                 silver_bucket = bucket
 
@@ -131,7 +128,7 @@ class InfraStack(Stack):
         glue_script_deployment = s3deploy.BucketDeployment(
             self,
             "GlueScriptDeployment",
-            sources=[s3deeploy.Source.asset(str(GLUE_SCRIPT_DIR))],
+            sources=[s3deploy.Source.asset(str(GLUE_SCRIPT_DIR))],
             destination_bucket=silver_bucket,
             destination_key_prefix="glue/scripts",
             prune=False,
@@ -161,6 +158,11 @@ class InfraStack(Stack):
             timeout=10,
             # Prevents automatic reruns during development.
             max_retries=0,
+            # This passes Bronze S3 bucket name into the Glue job as
+            # a runtime argument rather than hardcoding a bucket name in Python
+            default_arguments={
+                "--BRONZE_BUCKET": bronze_bucket.bucket_name,
+            },
         )
 
         # Ensure the script is uploaded before the job is created
