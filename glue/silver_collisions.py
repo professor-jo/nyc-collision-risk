@@ -7,6 +7,7 @@ for each collision.
 '''
 
 import sys
+import boto3
 
 from awsglue.utils import getResolvedOptions
 from pyspark.sql import SparkSession
@@ -31,9 +32,14 @@ from pyspark.sql.functions import (
 )
 
 # Read arguments passed from the Glue job configuration
-args = getResolvedOptions(sys.argv, ["JOB_NAME", "BRONZE_BUCKET"])
+args = getResolvedOptions(
+    sys.argv,
+    ["JOB_NAME", "BRONZE_BUCKET", "SILVER_BUCKET"]
+)
+
 # Retrieves the bucket name we configured in CDK
 bronze_bucket = args["BRONZE_BUCKET"]
+silver_bucket = args["SILVER_BUCKET"]
 
 # Entry point for processing data with Spark.
 spark = SparkSession.builder.getOrCreate()
@@ -146,6 +152,58 @@ critical_error = (
 valid_df = silver_df.filter(~critical_error)
 quarantine_df = silver_df.filter(critical_error)
 
+# Read modification timestamps for Bronze S3 files.
+s3_client = boto3.client("s3")
+
+paginator = s3_client.get_paginator("list_objects_v2")
+
+file_metadata = []
+
+for page in paginator.paginate(
+    Bucket=bronze_bucket,
+    Prefix="collisions/",
+):
+    for obj in page.get("Contents", []):
+        if obj["Key"].endswith(".json"):
+            file_metadata.append(
+                (
+                    f"s3://{bronze_bucket}/{obj['Key']}",
+                    obj["LastModified"],
+                )
+            )
+
+metadata_df = spark.createDataFrame(
+    file_metadata,
+    ["source_file", "source_modified_at"],
+)
+
+# Attach S3 timestamps to the corresponding collision records.
+valid_df = valid_df.join(
+    metadata_df,
+    on="source_file",
+    how="left",
+)
+
+missing_timestamps = valid_df.filter(
+    col("source_modified_at").isNull()
+).count()
+
+print("Missing S3 modification timestamps:", missing_timestamps)
+
+# Show both sets of paths so a failed join can be diagnosed from the job log.
+if missing_timestamps > 0:
+    print("=== UNMATCHED SOURCE FILES ===")
+    valid_df.filter(
+        col("source_modified_at").isNull()
+    ).select("source_file").distinct().show(20, truncate=False)
+
+    print("=== S3 METADATA PATHS ===")
+    metadata_df.select("source_file").show(20, truncate=False)
+
+assert missing_timestamps == 0, (
+    "Some Bronze records have no S3 modification timestamp"
+)
+
 valid_count = valid_df.count()
 unique_id_count = valid_df.select("collision_id").distinct().count()
 
@@ -209,6 +267,7 @@ window_spec = (
     .partitionBy("collision_id")
     .orderBy(
         col("ingestion_date").desc_nulls_last(),
+        col("source_modified_at").desc_nulls_last(),
         col("source_file").desc(),
         col("record_hash").desc(),
     )
@@ -226,6 +285,21 @@ deduplicated_df = (
     .filter(col("row_num") == 1)
     .drop("row_num", "record_hash")
 )
+
+# Columns used only for ETL validation.
+temporary_columns = [
+    "invalid_id",
+    "invalid_date",
+    "invalid_counts",
+    "location",
+]
+
+# Keep a clean, flat schema for analytical queries.
+# invalid_coordinates stays so spatial queries can exclude out-of-bounds rows.
+published_df = deduplicated_df.drop(*temporary_columns)
+
+print("=== FINAL SILVER SCHEMA ===")
+published_df.printSchema()
 
 after_count = deduplicated_df.count()
 

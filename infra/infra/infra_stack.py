@@ -158,10 +158,30 @@ class InfraStack(Stack):
             timeout=10,
             # Prevents automatic reruns during development.
             max_retries=0,
+
+
             # This passes Bronze S3 bucket name into the Glue job as
-            # a runtime argument rather than hardcoding a bucket name in Python
+            # a runtime argument rather than hardcoding a bucket name in Python.
             default_arguments={
                 "--BRONZE_BUCKET": bronze_bucket.bucket_name,
+                "--SILVER_BUCKET": silver_bucket.bucket_name,
+
+                # Enable Glue's built-in Apache Iceberg libraries.
+                "--datalake-formats": "iceberg",
+
+                # Configure Spark's Iceberg catalog.
+                "--conf": (
+                    "spark.sql.extensions="
+                    "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
+                    " --conf spark.sql.catalog.glue_catalog="
+                    "org.apache.iceberg.spark.SparkCatalog"
+                    " --conf spark.sql.catalog.glue_catalog.warehouse="
+                    f"s3://{silver_bucket.bucket_name}/"
+                    " --conf spark.sql.catalog.glue_catalog.catalog-impl="
+                    "org.apache.iceberg.aws.glue.GlueCatalog"
+                    " --conf spark.sql.catalog.glue_catalog.io-impl="
+                    "org.apache.iceberg.aws.s3.S3FileIO"
+                ),
             },
         )
 
@@ -173,6 +193,26 @@ class InfraStack(Stack):
 
         # Write transformed data to Silver
         silver_bucket.grant_read_write(glue_role)
+
+        # 
+        glue_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "glue:GetDatabase",
+                    "glue:GetTable",
+                    "glue:CreateTable",
+                    "glue:UpdateTable",
+                    "glue:GetPartitions",
+                ],
+                resources=[
+                    f"arn:aws:glue:{self.region}:{self.account}:catalog",
+                    f"arn:aws:glue:{self.region}:{self.account}:database/nyc_collision_lakehouse",
+                    f"arn:aws:glue:{self.region}:{self.account}:table/nyc_collision_lakehouse/*",
+                ],
+            )
+        )
+
+
 
 
         # Create Lambda
