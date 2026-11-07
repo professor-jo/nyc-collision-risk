@@ -18,7 +18,6 @@ from pyspark.sql.functions import (
     concat_ws,
     dayofweek,
     hour,
-    input_file_name,
     lit,
     month,
     regexp_extract,
@@ -29,6 +28,7 @@ from pyspark.sql.functions import (
     to_json,
     to_timestamp,
     trim,
+    greatest,
 )
 
 # Read arguments passed from the Glue job configuration
@@ -57,8 +57,10 @@ df = (
     .json(bronze_path)
 )
 
-# Track the source file for each record
-df = df.withColumn("source_file", input_file_name())
+# Track the source file for each record.
+# _metadata.file_path is deterministic, unlike input_file_name(), which
+# MERGE INTO rejects in its source plan.
+df = df.select("*", col("_metadata.file_path").alias("source_file"))
 
 # Convert raw string columns into analytical data types
 silver_df = (
@@ -240,6 +242,14 @@ valid_df = valid_df.withColumn(
     )
 )
 
+valid_df = valid_df.withColumn(
+    "source_version_at",
+    greatest(
+        col("ingestion_date").cast("timestamp"),
+        col("source_modified_at"),
+    ),
+)
+
 print("=== INGESTION DATE COVERAGE ===")
 
 valid_df.groupBy(
@@ -266,8 +276,7 @@ window_spec = (
     Window
     .partitionBy("collision_id")
     .orderBy(
-        col("ingestion_date").desc_nulls_last(),
-        col("source_modified_at").desc_nulls_last(),
+        col("source_version_at").desc_nulls_last(),
         col("source_file").desc(),
         col("record_hash").desc(),
     )
@@ -330,6 +339,61 @@ assert after_count == unique_id_count, (
 
 assert remaining_duplicates == 0, (
     "Duplicate collision IDs remain"
+)
+
+table_name = "glue_catalog.nyc_collision_lakehouse.silver_collisions"
+
+table_location = f"s3://{silver_bucket}/tables/silver_collisions/"
+
+published_df.createOrReplaceTempView("silver_updates")
+
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS {table_name}
+    USING iceberg
+    PARTITIONED BY (months(crash_date))
+    LOCATION '{table_location}'
+    TBLPROPERTIES (
+        'format-version' = '2',
+        'write.format.default' = 'parquet'
+    )
+    AS SELECT * FROM silver_updates WHERE 1 = 0
+""")
+
+# Insert new collisions and update existing ones in a single operation.
+# A row is replaced only when the incoming version is newer, so re-running
+# the job on older Bronze files never overwrites fresher data.
+spark.sql(f"""
+    MERGE INTO {table_name} AS target
+    USING silver_updates AS source
+    ON target.collision_id = source.collision_id
+
+    WHEN MATCHED AND (
+        source.source_version_at > target.source_version_at
+        OR (
+            source.source_version_at = target.source_version_at
+            AND source.source_file > target.source_file
+        )
+    )
+    THEN UPDATE SET *
+
+    WHEN NOT MATCHED
+    THEN INSERT *
+""")
+
+# Validate the persisted table, not just the in-memory DataFrame.
+result = spark.sql(f"""
+    SELECT
+        COUNT(*) AS total_records,
+        COUNT(DISTINCT collision_id) AS unique_records
+    FROM {table_name}
+""").first()
+
+print("=== P2.7 ICEBERG VALIDATION ===")
+print("Total records:", result["total_records"])
+print("Unique collision IDs:", result["unique_records"])
+
+assert result["total_records"] == result["unique_records"], (
+    "Duplicate collision IDs found in Silver Iceberg table"
 )
 
 spark.stop()
