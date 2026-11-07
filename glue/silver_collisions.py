@@ -29,6 +29,34 @@ from pyspark.sql.functions import (
     to_timestamp,
     trim,
     greatest,
+    udf,
+)
+
+from pyspark.sql.types import StringType
+
+import h3
+
+def coordinates_to_h3(latitude, longitude, resolution):
+    if latitude is None or longitude is None:
+        return None
+    if not (40.4 <= latitude <= 41.0):
+        return None
+    if not (-74.3 <= longitude <= -73.6):
+        return None
+
+    return h3.latlng_to_cell(
+        latitude,
+        longitude,
+        resolution,
+    )
+h3_res8_udf = udf(
+    lambda lat, lon: coordinates_to_h3(lat,lon,8),
+    StringType(),
+)
+
+h3_res9_udf = udf(
+    lambda lat, lon: coordinates_to_h3(lat,lon,9),
+    StringType()
 )
 
 # Read arguments passed from the Glue job configuration
@@ -307,6 +335,18 @@ temporary_columns = [
 # invalid_coordinates stays so spatial queries can exclude out-of-bounds rows.
 published_df = deduplicated_df.drop(*temporary_columns)
 
+published_df = (
+    published_df
+    .withColumn(
+        "h3_res8",
+        h3_res8_udf(col("latitude"), col("longitude")),    
+    )
+    .withColumn(
+        "h3_res9",
+        h3_res9_udf(col("latitude"), col("longitude")),
+    )
+)
+
 print("=== FINAL SILVER SCHEMA ===")
 published_df.printSchema()
 
@@ -359,6 +399,19 @@ spark.sql(f"""
     AS SELECT * FROM silver_updates WHERE 1 = 0
 """)
 
+# Add H3 columns to the existing Iceberg table.
+existing_columns = {
+    field.name
+    for field in spark.table(table_name).schema.fields
+}
+
+for column_name in ["h3_res8", "h3_res9"]:
+    if column_name not in existing_columns:
+        spark.sql(
+            f"ALTER TABLE {table_name} "
+            f"ADD COLUMNS ({column_name} STRING)"
+        )
+
 # Insert new collisions and update existing ones in a single operation.
 # A row is replaced only when the incoming version is newer, so re-running
 # the job on older Bronze files never overwrites fresher data.
@@ -369,9 +422,20 @@ spark.sql(f"""
 
     WHEN MATCHED AND (
         source.source_version_at > target.source_version_at
+
         OR (
             source.source_version_at = target.source_version_at
             AND source.source_file > target.source_file
+        )
+
+        OR (
+            source.source_version_at = target.source_version_at
+            AND source.source_file = target.source_file
+            AND (
+                (target.h3_res8 IS NULL AND source.h3_res8 IS NOT NULL)
+                OR
+                (target.h3_res9 IS NULL AND source.h3_res9 IS NOT NULL)
+            )
         )
     )
     THEN UPDATE SET *

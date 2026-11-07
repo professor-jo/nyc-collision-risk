@@ -166,6 +166,9 @@ class InfraStack(Stack):
                 "--BRONZE_BUCKET": bronze_bucket.bucket_name,
                 "--SILVER_BUCKET": silver_bucket.bucket_name,
 
+
+                "--additional-python-modules": "h3==4.3.1",
+
                 # Enable Glue's built-in Apache Iceberg libraries.
                 "--datalake-formats": "iceberg",
 
