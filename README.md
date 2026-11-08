@@ -40,7 +40,7 @@ CloudWatch alarms ---> SNS email alert
 
 One run does the following:
 
-1. **Take the lock.** If another run holds it, return `statusCode: 409` and skip. The lock expires after 10 minutes, so a crashed run can't block ingestion for good.
+1. **Take the lock.** If another run holds it, raise `IngestionLockHeld` and skip. The lock expires after 10 minutes, so a crashed run can't block ingestion for good.
 2. **Ingest new records.** Read the checkpoint, fetch 100 records at a time with keyset pagination on `(crash_date, collision_id)`, validate each batch, upload it, and only then advance the checkpoint. This stops after 240 seconds, or when under 60 seconds of Lambda time remain, and the next run resumes from the checkpoint.
 3. **Re-fetch recent dates.** See [Late-arriving records](#late-arriving-records).
 4. **Release the lock**, whether or not the run succeeded.
@@ -81,7 +81,7 @@ Then confirm the SNS subscription email, because alarm emails aren't delivered u
 
 ## Running it manually
 
-A run can take a few minutes, but the AWS CLI's default read timeout is 60 seconds, and it retries when that expires. The retry starts a second invocation, which gets a misleading 409 from the lock. Set a read timeout longer than the Lambda's 5-minute limit:
+A run can take a few minutes, but the AWS CLI's default read timeout is 60 seconds, and it retries when that expires. The retry starts a second invocation, which fails with a misleading `IngestionLockHeld` error. Set a read timeout longer than the Lambda's 5-minute limit:
 
 ```bash
 aws lambda invoke \
@@ -97,7 +97,7 @@ aws lambda invoke \
 
 NYC can publish a collision after the watermark has passed its crash date. So after each incremental run, the Lambda re-fetches the `LOOKBACK_DAYS` (14, in [`ingestion/config.py`](ingestion/config.py)) before the watermark, plus the watermark's own date, and stores them under `collisions/lookback/`.
 
-The lookback never moves the watermark, and it only uploads complete windows. If it runs short of time it uploads nothing and logs `LOOKBACK_STATUS=incomplete`, and the next run replays the whole window.
+The lookback never moves the watermark, and it only uploads complete windows. If it runs short of time or raises an error, it uploads nothing and logs `LOOKBACK_STATUS=incomplete`, and the next run replays the whole window. A lookback error doesn't fail the run, so the Lambda still reports what ingestion wrote.
 
 ### What Silver must do
 
@@ -127,8 +127,9 @@ A more robust later option is to emit an explicit completion metric for every sc
 ## Operational limitations
 
 - **Missed runs aren't detected.** No alarm fires if the schedule stops or a run never starts.
-- **Skipped runs don't alarm.** A 409 counts as a successful Lambda invocation.
-- **One slow request can outlast the time checks.** The time checks run before each request, but a single request with retries can take several minutes. If Lambda times out, the data stays safe and the error alarm fires. The lock stays held for up to 10 minutes, so Lambda's automatic retries may get a 409, and the next day's run catches up.
+- **Overlapping runs alarm.** A held lock raises `IngestionLockHeld`, which counts as a Lambda error and triggers `IngestionErrorAlarm`.
+- **A failing lookback only alarms after three days.** Lookback errors are logged as incomplete rather than raised, so `IngestionErrorAlarm` doesn't fire and Lambda doesn't retry. The next run replays the window.
+- **One slow request can outlast the time checks.** The time checks run before each request, but a single request with retries can take several minutes. If Lambda times out, the data stays safe and the error alarm fires. The lock stays held for up to 10 minutes, so Lambda's automatic retries may fail with `IngestionLockHeld`, and the next day's run catches up.
 - **Very late records can still be missed.** A record published when its crash date is already more than 14 days behind the watermark falls outside the window.
 - **The lookback window can't grow much without other changes.** A 14-day window took about 2 minutes of the 5-minute limit. A 30-day window would probably need a longer Lambda timeout and lock duration.
 - **Bronze grows by about 3 MB per day**, because each run with changed data stores a new copy of the window.
