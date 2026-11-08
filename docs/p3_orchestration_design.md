@@ -62,6 +62,7 @@ The Step Functions execution input:
 
 ```json
 {
+  "trigger": "scheduled",
   "mode": "scheduled | replay | backfill",
   "run_date": "2026-11-08",
   "backfill_start": "2026-10-01",
@@ -196,5 +197,5 @@ Use layered defenses. Each layer covers a gap in the others.
    - A backlog still unfinished after 5 runs releases the lock and ends in `Fail` with error `IngestionIncomplete`, so a stuck backlog is visible. The next day continues from the watermark.
    - The lookback runs once, when ingestion has caught up or on the final attempt, so it isn't repeated up to 5 times.
 3. **Held lock:**
-   - For `mode == scheduled`, `AcquirePipelineLock`'s `ConditionalCheckFailedException` goes to `Succeed` with output `{"result": "skipped"}`. No email is sent.
-   - For `replay` and `backfill`, it goes to `Fail` with error `PipelineLockUnavailable`, which triggers the failure alarm.
+   - For `trigger == scheduled`, `AcquirePipelineLock`'s `ConditionalCheckFailedException` goes to the `ScheduledRunSkipped` success state. No email is sent.
+   - For any other trigger, or none, it goes to `Fail` with error `PipelineLockUnavailable`, which triggers the failure alarm.

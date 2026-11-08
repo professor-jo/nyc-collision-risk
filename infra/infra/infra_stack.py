@@ -479,13 +479,38 @@ class InfraStack(Stack):
             cause="Another pipeline execution already owns the lock.",
         )
 
-        # If acquisition fails because the lock is held,
-        # route to an explicit failure state.
+        # A scheduled run that finds the lock held is skipped on purpose.
+        scheduled_run_skipped = sfn.Succeed(
+            self,
+            "ScheduledRunSkipped",
+        )
+
+        check_lock_conflict_trigger = sfn.Choice(
+            self,
+            "CheckLockConflictTrigger",
+        )
+
+        # A Choice state errors on a missing field, so check it exists.
+        # With no trigger, such as a manual start, the conflict stays visible.
+        check_lock_conflict_trigger.when(
+            sfn.Condition.and_(
+                sfn.Condition.is_present("$.trigger"),
+                sfn.Condition.string_equals("$.trigger", "scheduled"),
+            ),
+            scheduled_run_skipped,
+        )
+
+        check_lock_conflict_trigger.otherwise(lock_already_held)
+
+        # If acquisition fails because the lock is held, decide from the
+        # trigger. Without outputs, the catch would replace the input
+        # with the error and $.trigger would be lost.
         acquire_pipeline_lock.add_catch(
-            lock_already_held,
+            check_lock_conflict_trigger,
             errors=[
                 "DynamoDb.ConditionalCheckFailedException"
             ],
+            outputs="{% $states.input %}",
         )
 
         initialize_ingestion = sfn.Pass(
@@ -614,9 +639,9 @@ class InfraStack(Stack):
 
         # The execution ends with the original Lambda error, so the
         # console shows IngestionLockHeld rather than a generic failure.
-        ingestion_failed = sfn.Fail(
+        pipeline_failed = sfn.Fail(
             self,
-            "IngestionFailed",
+            "PipelineFailed",
             error_path="$.ingestion_error.Error",
             cause_path="$.ingestion_error.Cause",
         )
@@ -646,12 +671,12 @@ class InfraStack(Stack):
         # If the release still fails, report the Lambda error anyway.
         # A separate result_path keeps $.ingestion_error intact.
         release_lock_after_failure.add_catch(
-            ingestion_failed,
+            pipeline_failed,
             errors=["States.ALL"],
             result_path="$.release_error",
         )
 
-        release_lock_after_failure.next(ingestion_failed)
+        release_lock_after_failure.next(pipeline_failed)
 
         # Runs after the Lambda service retries on the task are used up.
         invoke_ingestion.add_catch(
@@ -681,8 +706,58 @@ class InfraStack(Stack):
             .next(invoke_ingestion)
         )
 
-        ingestion_complete.next(release_pipeline_lock)
-        ingestion_incomplete.next(release_pipeline_lock)
+        # ------------------------------------------------------------
+        # P3.7 — Conditional Silver job
+        # ------------------------------------------------------------
+
+        check_run_silver = sfn.Choice(
+            self,
+            "CheckRunSilver",
+        )
+
+        # Waits for the job to finish, so the lock stays held while
+        # Glue writes to the Silver table.
+        run_silver_job = tasks.GlueStartJobRun(
+            self,
+            "RunSilverJob",
+            glue_job_name=silver_job.ref,
+            integration_pattern=sfn.IntegrationPattern.RUN_JOB,
+            result_path="$.silver_result",
+        )
+
+        # Only a busy job is worth retrying. A failed job usually means
+        # bad data, and running it again won't fix that.
+        run_silver_job.add_retry(
+            errors=["Glue.ConcurrentRunsExceededException"],
+            interval=Duration.seconds(60),
+            max_attempts=3,
+            backoff_rate=1,
+        )
+
+        # Uses the same path as Lambda errors, so PipelineFailed reports
+        # the real error from either component.
+        run_silver_job.add_catch(
+            release_lock_after_failure,
+            errors=["States.ALL"],
+            result_path="$.ingestion_error",
+        )
+
+        # Silver also runs when ingestion didn't catch up, so data from
+        # those attempts isn't stranded in Bronze.
+        ingestion_complete.next(check_run_silver)
+        ingestion_incomplete.next(check_run_silver)
+
+        check_run_silver.when(
+            sfn.Condition.boolean_equals(
+                "$.ingestion_state.bronze_changed_any",
+                True,
+            ),
+            run_silver_job,
+        )
+
+        check_run_silver.otherwise(release_pipeline_lock)
+
+        run_silver_job.next(release_pipeline_lock)
 
         check_final_outcome = sfn.Choice(
             self,

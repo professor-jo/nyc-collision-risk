@@ -178,10 +178,10 @@ def test_lambda_failure_releases_lock_then_fails(template):
     }]
 
     release = states["ReleasePipelineLockAfterFailure"]
-    assert release["Next"] == "IngestionFailed"
+    assert release["Next"] == "PipelineFailed"
     assert release["Parameters"] == states["ReleasePipelineLock"]["Parameters"]
 
-    assert states["IngestionFailed"] == {
+    assert states["PipelineFailed"] == {
         "Type": "Fail",
         "ErrorPath": "$.ingestion_error.Error",
         "CausePath": "$.ingestion_error.Cause",
@@ -195,15 +195,17 @@ def test_failed_release_still_reports_the_lambda_error(template):
     assert release["Catch"] == [{
         "ErrorEquals": ["States.ALL"],
         "ResultPath": "$.release_error",
-        "Next": "IngestionFailed",
+        "Next": "PipelineFailed",
     }]
 
 
 def test_shared_release_separates_complete_from_incomplete(template):
     states = state_machine_states(template)
 
-    assert states["IngestionComplete"]["Next"] == "ReleasePipelineLock"
-    assert states["IngestionIncomplete"]["Next"] == "ReleasePipelineLock"
+    assert states["IngestionComplete"]["Next"] == "CheckRunSilver"
+    assert states["IngestionIncomplete"]["Next"] == "CheckRunSilver"
+    assert states["CheckRunSilver"]["Default"] == "ReleasePipelineLock"
+    assert states["RunSilverJob"]["Next"] == "ReleasePipelineLock"
     assert states["ReleasePipelineLock"]["Next"] == "CheckFinalOutcome"
 
     # The release must keep the input, or this check has nothing to read.
@@ -234,3 +236,226 @@ def test_normal_release_retries_and_tolerates_a_missing_lock(template):
         "ResultPath": "$.release_error",
         "Next": "CheckFinalOutcome",
     }]
+
+
+def test_lock_conflict_keeps_input_and_checks_the_trigger(template):
+    states = state_machine_states(template)
+
+    assert states["AcquirePipelineLock"]["Catch"] == [{
+        "ErrorEquals": ["DynamoDb.ConditionalCheckFailedException"],
+        "Output": "{% $states.input %}",
+        "Next": "CheckLockConflictTrigger",
+    }]
+
+    check = states["CheckLockConflictTrigger"]
+    assert check["Choices"] == [{
+        "And": [
+            {"Variable": "$.trigger", "IsPresent": True},
+            {"Variable": "$.trigger", "StringEquals": "scheduled"},
+        ],
+        "Next": "ScheduledRunSkipped",
+    }]
+    assert check["Default"] == "LockAlreadyHeld"
+
+    assert states["ScheduledRunSkipped"]["Type"] == "Succeed"
+    assert states["LockAlreadyHeld"]["Error"] == "PipelineLockUnavailable"
+
+
+def run_workflow(template, lambda_outcomes, glue_outcome=None):
+    """
+    Follow the generated transitions with fake Lambda and Glue outcomes.
+
+    An outcome containing "Error" acts as a failed task. Retries aren't
+    simulated. Returns the visited state names and the final data.
+    """
+    definition = state_machine_definition(template)
+    states = definition["States"]
+    outcomes = iter(lambda_outcomes)
+    data = {"trigger": "manual"}
+    visited = []
+    name = definition["StartAt"]
+
+    def get(path):
+        value = data
+        for key in path[2:].split("."):
+            value = value[key]
+        return value
+
+    def put(path, value):
+        target = data
+        keys = path[2:].split(".")
+        for key in keys[:-1]:
+            target = target.setdefault(key, {})
+        target[keys[-1]] = value
+
+    def rule_matches(rule):
+        if "And" in rule:
+            return all(rule_matches(part) for part in rule["And"])
+        if "IsPresent" in rule:
+            try:
+                get(rule["Variable"])
+                return rule["IsPresent"]
+            except KeyError:
+                return not rule["IsPresent"]
+
+        value = get(rule["Variable"])
+        if "StringEquals" in rule:
+            return value == rule["StringEquals"]
+        if "BooleanEquals" in rule:
+            return value is rule["BooleanEquals"]
+        return value >= rule["NumericGreaterThanEquals"]
+
+    for _ in range(100):
+        visited.append(name)
+        state = states[name]
+        kind = state["Type"]
+
+        if kind in ("Succeed", "Fail"):
+            return visited, data
+
+        if kind == "Choice":
+            name = next(
+                (c["Next"] for c in state["Choices"] if rule_matches(c)),
+                state["Default"],
+            )
+            continue
+
+        if kind == "Pass":
+            if "Parameters" in state:
+                value = {}
+                for key, item in state["Parameters"].items():
+                    if not key.endswith(".$"):
+                        value[key] = item
+                    elif item.startswith("States.MathAdd"):
+                        value[key[:-2]] = get(item.split("(")[1].split(",")[0]) + 1
+                    else:
+                        value[key[:-2]] = get(item)
+            else:
+                value = state["Result"]
+            put(state["ResultPath"], value)
+            name = state["Next"]
+            continue
+
+        # Task states.
+        if name == "InvokeCollisionIngestion":
+            outcome = next(outcomes)
+        elif name == "RunSilverJob":
+            outcome = glue_outcome or {"JobRunState": "SUCCEEDED"}
+        else:
+            outcome = {}
+
+        if "Error" in outcome:
+            catcher = next(
+                c for c in state["Catch"]
+                if "States.ALL" in c["ErrorEquals"]
+                or outcome["Error"] in c["ErrorEquals"]
+            )
+            put(catcher["ResultPath"], outcome)
+            name = catcher["Next"]
+            continue
+
+        if state.get("ResultPath"):
+            put(state["ResultPath"], outcome)
+        name = state["Next"]
+
+    raise AssertionError(f"Workflow did not finish: {visited[-10:]}")
+
+
+def ingestion(caught_up, bronze_changed):
+    return {
+        "statusCode": 200,
+        "caught_up": caught_up,
+        "bronze_changed": bronze_changed,
+        "lookback_ran": caught_up,
+        "lookback_complete": True if caught_up else None,
+    }
+
+
+def test_caught_up_with_bronze_changes_runs_silver(template):
+    visited, data = run_workflow(template, [ingestion(True, True)])
+
+    assert visited.index("RunSilverJob") < visited.index("ReleasePipelineLock")
+    assert visited[-1] == "LockTestSucceeded"
+    assert "ReleasePipelineLockAfterFailure" not in visited
+    assert data["ingestion_state"]["bronze_changed_any"] is True
+
+
+def test_caught_up_without_changes_skips_silver(template):
+    visited, _ = run_workflow(template, [ingestion(True, False)])
+
+    assert "RunSilverJob" not in visited
+    assert "ReleasePipelineLock" in visited
+    assert visited[-1] == "LockTestSucceeded"
+
+
+def test_incomplete_with_changes_runs_silver_then_fails(template):
+    # Only the first attempt wrote data, so the flag must carry forward.
+    outcomes = [ingestion(False, True)] + [ingestion(False, False)] * 4
+
+    visited, data = run_workflow(template, outcomes)
+
+    assert visited.count("InvokeCollisionIngestion") == 5
+    assert visited.index("RunSilverJob") < visited.index("ReleasePipelineLock")
+    assert visited[-1] == "IngestionNotCaughtUp"
+    assert data["ingestion_state"]["caught_up"] is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    ["Glue.ConcurrentRunsExceededException", "States.TaskFailed"],
+)
+def test_glue_failure_releases_lock_and_keeps_the_error(template, error):
+    failure = {"Error": error, "Cause": "Glue cause"}
+
+    visited, data = run_workflow(
+        template,
+        [ingestion(True, True)],
+        glue_outcome=failure,
+    )
+
+    assert visited[-3:] == [
+        "RunSilverJob",
+        "ReleasePipelineLockAfterFailure",
+        "PipelineFailed",
+    ]
+    assert "ReleasePipelineLock" not in visited
+    assert data["ingestion_error"] == failure
+
+
+def test_lambda_failure_never_reaches_silver(template):
+    failure = {"Error": "IngestionLockHeld", "Cause": "Lambda cause"}
+
+    visited, data = run_workflow(template, [failure])
+
+    assert "RunSilverJob" not in visited
+    assert visited[-2:] == ["ReleasePipelineLockAfterFailure", "PipelineFailed"]
+    assert data["ingestion_error"] == failure
+
+
+def test_silver_job_waits_and_retries_only_when_busy(template):
+    job = state_machine_states(template)["RunSilverJob"]
+
+    assert job["Resource"].endswith(":states:::glue:startJobRun.sync")
+    assert [r["ErrorEquals"] for r in job["Retry"]] == [
+        ["Glue.ConcurrentRunsExceededException"]
+    ]
+
+
+def test_worst_case_runtime_fits_the_execution_timeout(template):
+    definition = state_machine_definition(template)
+
+    functions = template.find_resources("AWS::Lambda::Function")
+    lambda_seconds = next(
+        f["Properties"]["Timeout"]
+        for f in functions.values()
+        if "lambda_handler" in f["Properties"].get("Handler", "")
+    )
+    jobs = template.find_resources("AWS::Glue::Job")
+    glue_seconds = next(iter(jobs.values()))["Properties"]["Timeout"] * 60
+
+    retry = definition["States"]["RunSilverJob"]["Retry"][0]
+    busy_wait_seconds = retry["IntervalSeconds"] * retry["MaxAttempts"]
+
+    worst_case = 5 * lambda_seconds + busy_wait_seconds + glue_seconds
+
+    assert worst_case <= definition["TimeoutSeconds"]
