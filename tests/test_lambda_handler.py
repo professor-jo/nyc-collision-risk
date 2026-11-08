@@ -249,3 +249,61 @@ def test_lookback_runs_when_no_attempt_is_passed():
 
     mock_lookback.assert_called_once()
     assert result["lookback_ran"] is True
+
+
+@patch("ingestion.lambda_handler.release_lock")
+@patch("ingestion.lambda_handler.run_backfill")
+@patch("ingestion.lambda_handler.run_lookback")
+@patch("ingestion.lambda_handler.main")
+@patch("ingestion.lambda_handler.acquire_lock")
+def test_backfill_runs_only_its_date_range(
+    mock_acquire, mock_main, mock_lookback, mock_backfill, mock_release
+):
+    mock_acquire.return_value = "owner-123"
+    mock_backfill.return_value = {"bronze_changed": True}
+    context = Mock()
+
+    result = lambda_handler(
+        {
+            "mode": "backfill",
+            "backfill_start": "2026-10-01",
+            "backfill_end": "2026-10-15",
+        },
+        context,
+    )
+
+    assert result == {
+        "statusCode": 200,
+        "caught_up": True,
+        "bronze_changed": True,
+        "lookback_ran": False,
+        "lookback_complete": None,
+    }
+    mock_backfill.assert_called_once_with(
+        "2026-10-01", "2026-10-15", context=context
+    )
+    mock_main.assert_not_called()
+    mock_lookback.assert_not_called()
+    mock_release.assert_called_once_with("owner-123")
+
+
+@patch("ingestion.lambda_handler.release_lock")
+@patch("ingestion.lambda_handler.run_backfill")
+@patch("ingestion.lambda_handler.acquire_lock")
+def test_backfill_failure_releases_lock_and_raises(
+    mock_acquire, mock_backfill, mock_release
+):
+    mock_acquire.return_value = "owner-123"
+    mock_backfill.side_effect = RuntimeError("API failure")
+
+    with pytest.raises(RuntimeError, match="API failure"):
+        lambda_handler(
+            {
+                "mode": "backfill",
+                "backfill_start": "2026-10-01",
+                "backfill_end": "2026-10-15",
+            },
+            None,
+        )
+
+    mock_release.assert_called_once_with("owner-123")

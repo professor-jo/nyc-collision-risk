@@ -261,7 +261,7 @@ def test_lock_conflict_keeps_input_and_checks_the_trigger(template):
     assert states["LockAlreadyHeld"]["Error"] == "PipelineLockUnavailable"
 
 
-def run_workflow(template, lambda_outcomes, glue_outcome=None):
+def run_workflow(template, lambda_outcomes, glue_outcome=None, execution_input=None):
     """
     Follow the generated transitions with fake Lambda and Glue outcomes.
 
@@ -271,7 +271,7 @@ def run_workflow(template, lambda_outcomes, glue_outcome=None):
     definition = state_machine_definition(template)
     states = definition["States"]
     outcomes = iter(lambda_outcomes)
-    data = {"trigger": "manual"}
+    data = {"trigger": "manual", **(execution_input or {})}
     visited = []
     name = definition["StartAt"]
 
@@ -289,6 +289,8 @@ def run_workflow(template, lambda_outcomes, glue_outcome=None):
         target[keys[-1]] = value
 
     def rule_matches(rule):
+        if "Not" in rule:
+            return not rule_matches(rule["Not"])
         if "And" in rule:
             return all(rule_matches(part) for part in rule["And"])
         if "IsPresent" in rule:
@@ -337,7 +339,7 @@ def run_workflow(template, lambda_outcomes, glue_outcome=None):
             continue
 
         # Task states.
-        if name == "InvokeCollisionIngestion":
+        if name in ("InvokeCollisionIngestion", "InvokeBackfill"):
             outcome = next(outcomes)
         elif name == "RunSilverJob":
             outcome = glue_outcome or {"JobRunState": "SUCCEEDED"}
@@ -459,3 +461,114 @@ def test_worst_case_runtime_fits_the_execution_timeout(template):
     worst_case = 5 * lambda_seconds + busy_wait_seconds + glue_seconds
 
     assert worst_case <= definition["TimeoutSeconds"]
+
+
+@pytest.mark.parametrize(
+    "metric_name",
+    ["ExecutionsFailed", "ExecutionsTimedOut"],
+)
+def test_pipeline_alarm_emails_the_alert_topic(template, metric_name):
+    alarms = template.find_resources("AWS::CloudWatch::Alarm", {
+        "Properties": {
+            "MetricName": metric_name,
+            "Namespace": "AWS/States",
+        },
+    })
+
+    assert len(alarms) == 1
+    properties = next(iter(alarms.values()))["Properties"]
+
+    assert properties["Threshold"] == 1
+    assert properties["EvaluationPeriods"] == 1
+    assert properties["TreatMissingData"] == "notBreaching"
+    assert properties["ComparisonOperator"] == "GreaterThanOrEqualToThreshold"
+    assert len(properties["AlarmActions"]) == 1
+    assert "IngestionAlertTopic" in properties["AlarmActions"][0]["Ref"]
+
+
+BACKFILL_INPUT = {
+    "mode": "backfill",
+    "backfill_start": "2026-10-01",
+    "backfill_end": "2026-10-15",
+}
+
+
+def test_replay_skips_ingestion_and_runs_silver(template):
+    visited, _ = run_workflow(template, [], execution_input={"mode": "replay"})
+
+    assert "InvokeCollisionIngestion" not in visited
+    assert "InvokeBackfill" not in visited
+    assert visited.index("AcquirePipelineLock") < visited.index("RunSilverJob")
+    assert visited.index("RunSilverJob") < visited.index("ReleasePipelineLock")
+    assert visited[-1] == "LockTestSucceeded"
+
+
+def test_replay_failure_releases_lock_and_keeps_the_error(template):
+    failure = {"Error": "States.TaskFailed", "Cause": "Glue cause"}
+
+    visited, data = run_workflow(
+        template,
+        [],
+        glue_outcome=failure,
+        execution_input={"mode": "replay"},
+    )
+
+    assert visited[-2:] == ["ReleasePipelineLockAfterFailure", "PipelineFailed"]
+    assert data["ingestion_error"] == failure
+
+
+def test_backfill_with_changes_runs_silver_once(template):
+    visited, _ = run_workflow(
+        template,
+        [ingestion(True, True)],
+        execution_input=BACKFILL_INPUT,
+    )
+
+    assert visited.count("InvokeBackfill") == 1
+    assert "InvokeCollisionIngestion" not in visited
+    assert "RunSilverJob" in visited
+    assert visited[-1] == "LockTestSucceeded"
+
+
+def test_backfill_without_changes_skips_silver(template):
+    visited, _ = run_workflow(
+        template,
+        [ingestion(True, False)],
+        execution_input=BACKFILL_INPUT,
+    )
+
+    assert "RunSilverJob" not in visited
+    assert visited[-1] == "LockTestSucceeded"
+
+
+def test_backfill_failure_releases_the_lock(template):
+    failure = {"Error": "BackfillIncomplete", "Cause": "Lambda cause"}
+
+    visited, data = run_workflow(
+        template,
+        [failure],
+        execution_input=BACKFILL_INPUT,
+    )
+
+    assert "RunSilverJob" not in visited
+    assert visited[-2:] == ["ReleasePipelineLockAfterFailure", "PipelineFailed"]
+    assert data["ingestion_error"] == failure
+
+
+@pytest.mark.parametrize("missing", ["backfill_start", "backfill_end"])
+def test_invalid_backfill_is_rejected_before_taking_the_lock(template, missing):
+    execution_input = {k: v for k, v in BACKFILL_INPUT.items() if k != missing}
+
+    visited, _ = run_workflow(template, [], execution_input=execution_input)
+
+    assert visited == ["ValidateRunInput", "InvalidBackfillInput"]
+
+
+def test_backfill_payload_reaches_the_lambda(template):
+    backfill = state_machine_states(template)["InvokeBackfill"]
+
+    assert backfill["Parameters"] == {
+        "mode": "backfill",
+        "backfill_start.$": "$.backfill_start",
+        "backfill_end.$": "$.backfill_end",
+    }

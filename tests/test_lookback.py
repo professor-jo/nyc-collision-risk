@@ -12,6 +12,9 @@ S3, the API and the watermark are all mocked.
 
 from unittest.mock import Mock, patch
 
+import pytest
+from botocore.exceptions import ClientError
+
 from ingestion import ingest_collisions, lookback_collisions
 
 
@@ -195,3 +198,74 @@ def test_upload_key_is_partitioned_by_ingestion_date():
 
     assert key.startswith("collisions/lookback/ingestion_date=")
     assert "/start_date=2026-10-13/end_date=2026-10-28/batch_" in key
+
+
+def test_backfill_normalizes_dates_and_uses_its_own_prefix():
+    records = [{"collision_id": "abc"}]
+
+    with (
+        patch.object(
+            lookback_collisions,
+            "fetch_lookback_records",
+            return_value=(records, True),
+        ) as mock_fetch,
+        patch.object(
+            lookback_collisions,
+            "upload_lookback_to_s3",
+            return_value=True,
+        ) as mock_upload,
+        patch.object(lookback_collisions, "load_watermark") as mock_watermark,
+    ):
+        result = lookback_collisions.run_backfill("2026-10-01", "2026-10-15")
+
+    start, end = "2026-10-01T00:00:00.000", "2026-10-15T00:00:00.000"
+    assert result == {"bronze_changed": True}
+    mock_fetch.assert_called_once_with(start, end, context=None)
+    mock_upload.assert_called_once_with(
+        records, start, end, prefix="collisions/backfill"
+    )
+    mock_watermark.assert_not_called()
+
+
+def test_incomplete_backfill_raises_and_uploads_nothing():
+    with (
+        patch.object(
+            lookback_collisions,
+            "fetch_lookback_records",
+            return_value=([{"collision_id": "abc"}], False),
+        ),
+        patch.object(lookback_collisions, "upload_lookback_to_s3") as mock_upload,
+    ):
+        with pytest.raises(lookback_collisions.BackfillIncomplete):
+            lookback_collisions.run_backfill("2026-10-01", "2026-10-15")
+
+    mock_upload.assert_not_called()
+
+
+def test_backfill_rejects_a_reversed_date_range():
+    with patch.object(lookback_collisions, "fetch_lookback_records") as mock_fetch:
+        with pytest.raises(ValueError):
+            lookback_collisions.run_backfill("2026-10-15", "2026-10-01")
+
+    mock_fetch.assert_not_called()
+
+
+def test_upload_writes_under_the_given_prefix():
+    s3 = Mock()
+    s3.head_object.side_effect = ClientError(
+        {"Error": {"Code": "404"}},
+        "HeadObject",
+    )
+
+    with patch.object(lookback_collisions.boto3, "client", return_value=s3):
+        uploaded = lookback_collisions.upload_lookback_to_s3(
+            [{"collision_id": "abc"}],
+            "2026-10-01T00:00:00.000",
+            "2026-10-15T00:00:00.000",
+            prefix="collisions/backfill",
+        )
+
+    assert uploaded is True
+    key = s3.put_object.call_args.kwargs["Key"]
+    assert key.startswith("collisions/backfill/ingestion_date=")
+    assert "start_date=2026-10-01/end_date=2026-10-15/" in key

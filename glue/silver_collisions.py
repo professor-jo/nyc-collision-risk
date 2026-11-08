@@ -239,9 +239,12 @@ unique_id_count = valid_df.select("collision_id").distinct().count()
 
 print("=== P2.5 DATA QUALITY RESULTS ===")
 
-print("Total records:", silver_df.count())
+total_count = silver_df.count()
+quarantine_count = quarantine_df.count()
+
+print("Total records:", total_count)
 print("Valid records:", valid_count)
-print("Quarantined records:", quarantine_df.count())
+print("Quarantined records:", quarantine_count)
 
 silver_df.groupBy(
     "invalid_id",
@@ -381,7 +384,24 @@ assert remaining_duplicates == 0, (
     "Duplicate collision IDs remain"
 )
 
-table_name = "glue_catalog.nyc_collision_lakehouse.silver_collisions"
+# Stop before writing if this run looks wrong. A sudden jump in rejected
+# rows usually means the source format changed, and the filters would
+# otherwise drop those collisions without failing the job.
+MAX_QUARANTINE_RATE = 0.01
+
+quarantine_rate = quarantine_count / total_count if total_count else 1.0
+
+print("=== PRE-WRITE QUALITY GATE ===")
+print("Quarantine rate:", quarantine_rate)
+
+assert valid_count > 0, "No valid Bronze records to publish"
+
+assert quarantine_rate <= MAX_QUARANTINE_RATE, (
+    f"Quarantine rate {quarantine_rate:.2%} exceeds "
+    f"{MAX_QUARANTINE_RATE:.0%}"
+)
+
+table_name ="glue_catalog.nyc_collision_lakehouse.silver_collisions"
 
 table_location = f"s3://{silver_bucket}/tables/silver_collisions/"
 
@@ -445,12 +465,35 @@ spark.sql(f"""
 """)
 
 # Validate the persisted table, not just the in-memory DataFrame.
-result = spark.sql(f"""
+negative_count_condition = " OR ".join(
+    f"{column_name} < 0" for column_name in count_columns
+)
+
+usable_coordinates = (
+    "(latitude IS NOT NULL AND longitude IS NOT NULL "
+    "AND NOT COALESCE(invalid_coordinates, FALSE))"
+)
+
+quality_query = f"""
     SELECT
         COUNT(*) AS total_records,
-        COUNT(DISTINCT collision_id) AS unique_records
+        COUNT(DISTINCT collision_id) AS unique_records,
+        COUNT_IF(collision_id IS NULL OR TRIM(collision_id) = '') AS missing_ids,
+        COUNT_IF(crash_date IS NULL) AS missing_crash_dates,
+        COUNT_IF({negative_count_condition}) AS negative_counts,
+        COUNT_IF(source_version_at IS NULL) AS missing_source_versions,
+        COUNT_IF(
+            {usable_coordinates}
+            AND (h3_res8 IS NULL OR h3_res9 IS NULL)
+        ) AS usable_without_h3,
+        COUNT_IF(
+            NOT {usable_coordinates}
+            AND (h3_res8 IS NOT NULL OR h3_res9 IS NOT NULL)
+        ) AS unusable_with_h3
     FROM {table_name}
-""").first()
+"""
+
+result = spark.sql(quality_query).first()
 
 print("=== P2.7 ICEBERG VALIDATION ===")
 print("Total records:", result["total_records"])
@@ -458,6 +501,33 @@ print("Unique collision IDs:", result["unique_records"])
 
 assert result["total_records"] == result["unique_records"], (
     "Duplicate collision IDs found in Silver Iceberg table"
+)
+
+# Every collision published by this run must be in the table.
+assert result["total_records"] >= after_count, (
+    "Silver Iceberg table has fewer records than this run published"
+)
+
+# Report every failed rule at once, so one run shows the whole problem.
+quality_rules = [
+    "missing_ids",
+    "missing_crash_dates",
+    "negative_counts",
+    "missing_source_versions",
+    "usable_without_h3",
+    "unusable_with_h3",
+]
+
+quality_results = {rule: result[rule] for rule in quality_rules}
+
+print("Quality rules:", quality_results)
+
+quality_failures = {
+    rule: count for rule, count in quality_results.items() if count > 0
+}
+
+assert not quality_failures, (
+    f"Silver quality checks failed: {quality_failures}"
 )
 
 spark.stop()

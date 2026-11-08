@@ -113,7 +113,12 @@ def fetch_lookback_records(start_date, end_date, context=None):
 
 
 
-def upload_lookback_to_s3(records, start_date, end_date):
+def upload_lookback_to_s3(
+    records,
+    start_date,
+    end_date,
+    prefix="collisions/lookback",
+):
     '''
     Store a historical collision batch in S3 Bronze
 
@@ -146,7 +151,7 @@ def upload_lookback_to_s3(records, start_date, end_date):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     object_key = (
-        f"collisions/lookback/"
+        f"{prefix}/"
         f"ingestion_date={today}/"
         f"start_date={start_day}/"
         f"end_date={end_day}/"
@@ -232,6 +237,53 @@ def run_lookback(context=None):
         "bronze_changed": uploaded,
         "lookback_complete": True,
     }
+
+
+class BackfillIncomplete(Exception):
+    pass
+
+
+def run_backfill(start_date, end_date, context=None):
+    '''
+    Re-fetch a chosen date range and store it in S3 Bronze.
+
+    start_date is included and end_date is excluded. Like the lookback,
+    this never moves the watermark and only uploads complete windows.
+    '''
+
+    start = datetime.fromisoformat(start_date)
+    end = datetime.fromisoformat(end_date)
+
+    if start >= end:
+        raise ValueError("backfill_start must be before backfill_end")
+
+    start_text = start.isoformat(timespec="milliseconds")
+    end_text = end.isoformat(timespec="milliseconds")
+
+    records, complete = fetch_lookback_records(
+        start_text,
+        end_text,
+        context=context,
+    )
+
+    print(f"Backfill window: {start_text} to {end_text}")
+    print(f"Fetched {len(records)} backfill records")
+
+    # Unlike the lookback, no later run replays this window on its own,
+    # so an unfinished backfill must fail rather than look successful.
+    if not complete:
+        raise BackfillIncomplete(
+            "Ran out of Lambda time. Backfill a smaller date range."
+        )
+
+    uploaded = upload_lookback_to_s3(
+        records,
+        start_text,
+        end_text,
+        prefix="collisions/backfill",
+    )
+
+    return {"bronze_changed": uploaded}
 
 
 ############################## Running the script ##########################################

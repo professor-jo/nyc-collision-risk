@@ -699,13 +699,6 @@ class InfraStack(Stack):
             time=sfn.WaitTime.duration(Duration.seconds(60)),
         )
 
-        # Happy path: acquire, hold, release, succeed.
-        lock_definition = (
-            acquire_pipeline_lock
-            .next(initialize_ingestion)
-            .next(invoke_ingestion)
-        )
-
         # ------------------------------------------------------------
         # P3.7 — Conditional Silver job
         # ------------------------------------------------------------
@@ -759,6 +752,94 @@ class InfraStack(Stack):
 
         run_silver_job.next(release_pipeline_lock)
 
+        # ------------------------------------------------------------
+        # P3 — Replay and backfill modes
+        # ------------------------------------------------------------
+
+        # Replay reprocesses what is already in Bronze. It marks the run
+        # as caught up so the final outcome check reports success.
+        mark_replay_ready = sfn.Pass(
+            self,
+            "MarkReplayReady",
+            result=sfn.Result.from_boolean(True),
+            result_path="$.ingestion_state.caught_up",
+        )
+
+        mark_replay_ready.next(run_silver_job)
+
+        invoke_backfill = tasks.LambdaInvoke(
+            self,
+            "InvokeBackfill",
+            lambda_function=ingestion_lambda,
+            payload=sfn.TaskInput.from_object({
+                "mode": "backfill",
+                "backfill_start": sfn.JsonPath.string_at("$.backfill_start"),
+                "backfill_end": sfn.JsonPath.string_at("$.backfill_end"),
+            }),
+            payload_response_only=True,
+            result_path="$.ingestion_result",
+        )
+
+        invoke_backfill.add_catch(
+            release_lock_after_failure,
+            errors=["States.ALL"],
+            result_path="$.ingestion_error",
+        )
+
+        # The Lambda reports caught_up, so a backfill runs only once
+        # and then follows the same Silver gate as normal ingestion.
+        invoke_backfill.next(check_bronze_changed)
+
+        def mode_is(mode):
+            # A Choice state errors on a missing field, so check it exists.
+            return sfn.Condition.and_(
+                sfn.Condition.is_present("$.mode"),
+                sfn.Condition.string_equals("$.mode", mode),
+            )
+
+        check_run_mode = sfn.Choice(
+            self,
+            "CheckRunMode",
+        )
+
+        check_run_mode.when(mode_is("replay"), mark_replay_ready)
+        check_run_mode.when(mode_is("backfill"), invoke_backfill)
+        check_run_mode.otherwise(invoke_ingestion)
+
+        acquire_pipeline_lock.next(initialize_ingestion)
+        initialize_ingestion.next(check_run_mode)
+
+        invalid_backfill_input = sfn.Fail(
+            self,
+            "InvalidBackfillInput",
+            error="InvalidBackfillInput",
+            cause="Backfill runs need backfill_start and backfill_end.",
+        )
+
+        # Reject bad input before taking the lock. A missing path later
+        # would stop the execution with the lock still held.
+        validate_run_input = sfn.Choice(
+            self,
+            "ValidateRunInput",
+        )
+
+        validate_run_input.when(
+            sfn.Condition.and_(
+                mode_is("backfill"),
+                sfn.Condition.not_(
+                    sfn.Condition.and_(
+                        sfn.Condition.is_present("$.backfill_start"),
+                        sfn.Condition.is_present("$.backfill_end"),
+                    ),
+                ),
+            ),
+            invalid_backfill_input,
+        )
+
+        validate_run_input.otherwise(acquire_pipeline_lock)
+
+        lock_definition = validate_run_input
+
         check_final_outcome = sfn.Choice(
             self,
             "CheckFinalOutcome",
@@ -808,3 +889,40 @@ class InfraStack(Stack):
             ),
             timeout=pipeline_timeout,
         )
+
+        # ------------------------------------------------------------
+        # P3 — Pipeline failure alerts
+        # ------------------------------------------------------------
+
+        # Alarms cover every way an execution can end badly, including
+        # timeouts, where no state in the workflow gets a chance to run.
+        # Stopped executions are left out because a person chose to stop
+        # them, and a skipped scheduled run counts as a success.
+        pipeline_alarms = {
+            "PipelineExecutionsFailedAlarm": (
+                pipeline_lock_state_machine.metric_failed,
+                "NYC collision pipeline execution failed",
+            ),
+            "PipelineExecutionsTimedOutAlarm": (
+                pipeline_lock_state_machine.metric_timed_out,
+                "NYC collision pipeline execution timed out",
+            ),
+        }
+
+        for alarm_id, (metric, description) in pipeline_alarms.items():
+            pipeline_alarm = cloudwatch.Alarm(
+                self,
+                alarm_id,
+                metric=metric(
+                    period=Duration.minutes(5),
+                    statistic="Sum",
+                ),
+                threshold=1,
+                evaluation_periods=1,
+                alarm_description=description,
+                treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+            )
+
+            pipeline_alarm.add_alarm_action(
+                cw_actions.SnsAction(alert_topic)
+            )

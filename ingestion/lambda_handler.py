@@ -2,7 +2,7 @@
 from ingestion.config import MAX_INGESTION_ATTEMPTS
 from ingestion.ingest_collisions import main
 from ingestion.lock import acquire_lock, release_lock
-from ingestion.lookback_collisions import run_lookback
+from ingestion.lookback_collisions import run_backfill, run_lookback
 
 
 class IngestionLockHeld(Exception):
@@ -19,6 +19,23 @@ def lambda_handler(event, context):
         )
 
     try:
+        # A backfill fetches only its own date range. It uses the same
+        # response contract, and caught_up stops the catch-up loop.
+        if event.get("mode") == "backfill":
+            backfill = run_backfill(
+                event["backfill_start"],
+                event["backfill_end"],
+                context=context,
+            )
+
+            return {
+                "statusCode": 200,
+                "caught_up": True,
+                "bronze_changed": backfill["bronze_changed"],
+                "lookback_ran": False,
+                "lookback_complete": None,
+            }
+
         # Execute the existing NYC collision ingestion pipeline.
         incremental = main(context=context)
 
