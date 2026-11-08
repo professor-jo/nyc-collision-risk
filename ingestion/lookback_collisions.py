@@ -123,7 +123,7 @@ def upload_lookback_to_s3(records, start_date, end_date):
     '''
     if not records:
         print("No historical records to upload.")
-        return
+        return False
 
     bucket = os.environ.get("BRONZE_BUCKET")
     s3 = boto3.client("s3")
@@ -175,7 +175,7 @@ def upload_lookback_to_s3(records, start_date, end_date):
     else:
         print("Identical lookback batch already exists in S3.")
         print("Skipping upload.")
-        return
+        return False
 
     # Upload only if the object was not found.
     s3.put_object(
@@ -189,6 +189,7 @@ def upload_lookback_to_s3(records, start_date, end_date):
 
     print(f"Uploaded {len(records)} records to S3.")
     print(f"S3 location: s3://{bucket}/{object_key}")
+    return True
 
 def run_lookback(context=None):
     '''
@@ -214,11 +215,23 @@ def run_lookback(context=None):
     if not complete:
         # A CloudWatch alarm in InfraStack watches for this exact text.
         print("LOOKBACK_STATUS=incomplete: nothing uploaded")
-        return
+        return {
+            'bronze_changed': False,
+            'lookback_complete': False,
+        }
 
-    upload_lookback_to_s3(records, start_date, end_date)
+    uploaded = upload_lookback_to_s3(
+        records,
+        start_date,
+        end_date,
+    )
 
     print("LOOKBACK_STATUS=complete")
+
+    return {
+        "bronze_changed": uploaded,
+        "lookback_complete": True,
+    }
 
 
 ############################## Running the script ##########################################

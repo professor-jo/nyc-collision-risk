@@ -65,7 +65,8 @@ def test_checkpoint_failure():
         ),
         patch.object(
             ingest_collisions,
-            "upload_to_s3"
+            "upload_to_s3",
+            return_value=True,
         ) as mock_upload,
         patch.object(
             ingest_collisions,
@@ -148,3 +149,31 @@ def test_duplicate_upload_skipped():
 
         # Confirm that no new upload was performed.
         mock_s3.put_object.assert_not_called()
+
+
+def test_upload_reports_whether_it_wrote():
+    """upload_to_s3 returns True for a new object and False for a skip."""
+    import json
+    import hashlib
+
+    records = [{"crash_date": "2026-10-06T00:00:00.000", "collision_id": "abc123"}]
+    last_key = ("2026-10-06T00:00:00.000", "abc123")
+    checksum = hashlib.sha256(
+        json.dumps(records, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+    from botocore.exceptions import ClientError
+
+    with patch.object(ingest_collisions.boto3, "client") as mock_client:
+        mock_s3 = mock_client.return_value
+
+        # No existing object: the batch is written.
+        mock_s3.head_object.side_effect = ClientError(
+            {"Error": {"Code": "404"}}, "HeadObject"
+        )
+        assert ingest_collisions.upload_to_s3(records, last_key) is True
+
+        # Identical object already exists: the upload is skipped.
+        mock_s3.head_object.side_effect = None
+        mock_s3.head_object.return_value = {"Metadata": {"sha256": checksum}}
+        assert ingest_collisions.upload_to_s3(records, last_key) is False

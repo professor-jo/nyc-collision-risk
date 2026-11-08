@@ -17,15 +17,20 @@ def lambda_handler(event, context):
 
     try:
         # Execute the existing NYC collision ingestion pipeline.
-        main(context=context)
+        incremental = main(context=context)
 
         # Re-fetch recent dates for records published after the watermark
         # passed them. This never moves the watermark.
-        run_lookback(context=context)
+        lookback = run_lookback(context=context)
 
         return {
             "statusCode": 200,
-            "message": "Collision ingestion completed",
+            "bronze_changed": (
+                incremental['bronze_changed']
+                or lookback['bronze_changed']
+            ),
+            'caught_up': incremental['caught_up'],
+            'lookback_complete': lookback['lookback_complete'],
         }
 
     # Unlike try / except pair which handles errors, 

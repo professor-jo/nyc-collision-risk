@@ -85,6 +85,14 @@ def test_lookback_failure(mock_acquire, mock_main, mock_lookback, mock_release):
 def test_incremental_runs_before_lookback(mock_acquire, mock_main, mock_lookback, mock_release):
     mock_acquire.return_value = "owner-123"
 
+    # Return plain dicts, like the real functions. Reading keys from a
+    # MagicMock result would be recorded as extra calls below.
+    mock_main.return_value = {"caught_up": True, "bronze_changed": False}
+    mock_lookback.return_value = {
+        "bronze_changed": False,
+        "lookback_complete": True,
+    }
+
     steps = Mock()
     steps.attach_mock(mock_main, "main")
     steps.attach_mock(mock_lookback, "lookback")
@@ -96,3 +104,43 @@ def test_incremental_runs_before_lookback(mock_acquire, mock_main, mock_lookback
         call.main(context=context),
         call.lookback(context=context),
     ]
+
+
+@pytest.mark.parametrize(
+    "incremental_changed, lookback_changed, expected",
+    [
+        (False, False, False),
+        (True, False, True),
+        (False, True, True),
+        (True, True, True),
+    ],
+)
+@patch("ingestion.lambda_handler.release_lock")
+@patch("ingestion.lambda_handler.run_lookback")
+@patch("ingestion.lambda_handler.main")
+@patch("ingestion.lambda_handler.acquire_lock")
+def test_result_combines_incremental_and_lookback(
+    mock_acquire,
+    mock_main,
+    mock_lookback,
+    mock_release,
+    incremental_changed,
+    lookback_changed,
+    expected,
+):
+    """Bronze changed if either the incremental run or the lookback wrote."""
+    mock_acquire.return_value = "owner-123"
+    mock_main.return_value = {
+        "caught_up": False,
+        "bronze_changed": incremental_changed,
+    }
+    mock_lookback.return_value = {
+        "bronze_changed": lookback_changed,
+        "lookback_complete": True,
+    }
+
+    result = lambda_handler({}, None)
+
+    assert result["bronze_changed"] is expected
+    assert result["caught_up"] is False
+    assert result["lookback_complete"] is True

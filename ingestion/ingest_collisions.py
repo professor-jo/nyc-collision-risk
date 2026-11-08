@@ -142,7 +142,8 @@ def upload_to_s3(records, last_key):
 
     Input:  records: list[dict] -> raw collision records
             last_key: tuple[str, str] -> (crash_date, collision_id) of the newest record
-    Output: None (uploads one JSON object to S3)
+    Output: bool -> True if a new object was written, False if an
+            identical one already existed
     """
 
     # Create an S3 client using our AWS credentials
@@ -193,7 +194,7 @@ def upload_to_s3(records, last_key):
 
         if existing_checksum == checksum:
             print("Identical batch already exists. Skipping upload.")
-            return
+            return False
 
         raise ValueError(
             "S3 object already exists with different contents: "
@@ -212,6 +213,7 @@ def upload_to_s3(records, last_key):
     )
     # This message appears only after a successful new upload.
     print(f"Uploaded to s3://{BUCKET_NAME}/{object_key}")
+    return True
 
 
 
@@ -251,13 +253,31 @@ def create_session():
 
 
 def main(context=None):
-    """Ingest collision records in batches within a time budget."""
+    """Ingest collision records in batches within a time budget.
+
+    Returns a summary that Step Functions uses to decide what to do next:
+        caught_up: bool -> True if the API has no more records after the
+                   watermark. False if the run stopped for time, so Step
+                   Functions should invoke ingestion again.
+        bronze_changed: bool -> True if at least one new Bronze object was
+                   written, so Step Functions should run Glue.
+        batches_written: int -> new Bronze objects created this run.
+                   Batches that already existed unchanged are not counted.
+        records_ingested: int -> records fetched and saved this run
+        watermark: dict -> the checkpoint after this run
+    """
 
     start_time = time.monotonic()
     watermark = load_watermark()
 
     total_records = 0
     batch_number = 0
+    batches_written = 0
+    cuaght_up = False
+
+    # Stays False unless the API runs out of records. Every time-based
+    # exit leaves it False, so the caller knows more may remain.
+    caught_up = False
 
     print(f"Starting watermark: {watermark}")
 
@@ -283,13 +303,18 @@ def main(context=None):
         # A short batch means we reached the current end of the API.
         if not records:
             print("No new records found")
+            caught_up = True
             break
 
         # Validate before saving anything.
         new_watermark = validate_records(records, watermark)
 
+
+        uploaded = upload_to_s3(records, new_watermark)
+
         # Store the raw data before advancing the checkpoint.
-        upload_to_s3(records, new_watermark)
+        if uploaded:
+            batches_written += 1
 
         # Only advance the checkpoint after a successful upload.
         save_watermark(new_watermark)
@@ -308,12 +333,25 @@ def main(context=None):
         # Fewer than 100 records means no more pages right now.
         if len(records) < BATCH_SIZE:
             print("Caught up with the API")
+            caught_up = True
             break
 
     print(
         f"Ingestion finished: {total_records} records "
-        f"across {batch_number} batches"
+        f"across {batch_number} batches, "
+        f"{batches_written} new batches written, caught_up={caught_up}"
     )
+
+    return {
+        "caught_up": caught_up,
+        "bronze_changed": batches_written > 0,
+        "batches_written": batches_written,
+        "records_ingested": total_records,
+        "watermark": {
+            "last_crash_date": watermark[0],
+            "last_collision_id": watermark[1],
+        },
+    }
 
 # Run main() only when this file is executed directly,
 # not when it's imported by another module

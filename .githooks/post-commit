@@ -1,0 +1,28 @@
+#!/bin/sh
+# Push to origin/main after every commit made on main.
+#
+# The pre-push hook runs the tests first, so a failing commit stays local.
+# Skip once with:  SKIP_AUTO_PUSH=1 git commit -m "..."
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+
+if [ "$branch" != "main" ]; then
+    exit 0
+fi
+
+if [ "$SKIP_AUTO_PUSH" = "1" ]; then
+    echo "auto-push: skipped (SKIP_AUTO_PUSH=1)"
+    exit 0
+fi
+
+echo "auto-push: pushing main to origin..."
+
+if git push origin main; then
+    echo "auto-push: done"
+else
+    # Never fail the commit itself. The commit is saved locally either way.
+    echo "auto-push: FAILED. Your commit is saved locally."
+    echo "auto-push: fix the problem above, then run: git push origin main"
+fi
+
+exit 0

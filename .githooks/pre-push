@@ -1,0 +1,33 @@
+#!/bin/sh
+# Run the tests before any push. A failing test blocks the push.
+# Bypass once (not recommended) with:  git push --no-verify
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root" || exit 1
+
+# Prefer the project's virtual environment, then an active one, then python3.
+if [ -x "$repo_root/../.venv/bin/python" ]; then
+    python="$repo_root/../.venv/bin/python"
+elif [ -n "$VIRTUAL_ENV" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+    python="$VIRTUAL_ENV/bin/python"
+else
+    python="python3"
+fi
+
+# The infrastructure tests need the generated lambda_package/ folder.
+test_paths="tests/"
+if [ -d lambda_package ]; then
+    test_paths="tests/ infra/tests/"
+else
+    echo "pre-push: lambda_package/ missing, skipping infra tests"
+    echo "pre-push: build it with: bash scripts/build_lambda_package.sh"
+fi
+
+echo "pre-push: running tests ($test_paths)..."
+
+if ! "$python" -m pytest $test_paths -q; then
+    echo "pre-push: tests failed, push blocked"
+    exit 1
+fi
+
+echo "pre-push: tests passed"

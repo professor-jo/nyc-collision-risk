@@ -46,6 +46,7 @@ def test_multiple_batches_update_checkpoint():
         patch.object(
             ingest_collisions,
             "upload_to_s3",
+            return_value=True,
         ) as mock_upload,
         patch.object(
             ingest_collisions,
@@ -177,7 +178,7 @@ def test_ingestion_stops_at_time_budget():
             "validate_records",
             return_value=watermark,
         ),
-        patch.object(ingest_collisions, "upload_to_s3"),
+        patch.object(ingest_collisions, "upload_to_s3", return_value=True),
         patch.object(ingest_collisions, "save_watermark") as mock_save,
         patch.object(
             ingest_collisions.time,
@@ -191,3 +192,130 @@ def test_ingestion_stops_at_time_budget():
     mock_fetch.assert_called_once()
     mock_save.assert_called_once_with(watermark)
 
+
+
+# --- Run summary returned to the Lambda and Step Functions ---
+
+OLD_WATERMARK = ("2026-10-01T00:00:00.000", "fdbdc3a754bcb7538295548469bc4631")
+NEW_WATERMARK = ("2026-10-02T00:00:00.000", "473b14600b6e9df374c28da7f9613c8a")
+
+
+def run_main(fetch_side_effect, upload_side_effect=None, **main_kwargs):
+    """Run main() with the API, S3 and checkpoint mocked out."""
+    with (
+        patch.object(
+            ingest_collisions, "load_watermark", return_value=OLD_WATERMARK
+        ),
+        patch.object(
+            ingest_collisions, "fetch_records", side_effect=fetch_side_effect
+        ),
+        patch.object(
+            ingest_collisions, "validate_records", return_value=NEW_WATERMARK
+        ),
+        patch.object(
+            ingest_collisions,
+            "upload_to_s3",
+            side_effect=upload_side_effect,
+            return_value=True,
+        ),
+        patch.object(ingest_collisions, "save_watermark"),
+    ):
+        return ingest_collisions.main(**main_kwargs)
+
+
+def test_summary_reports_caught_up_after_empty_response():
+    full_batch = [{"collision_id": f"{i:032x}"} for i in range(100)]
+
+    result = run_main([full_batch, []])
+
+    assert result == {
+        "caught_up": True,
+        "bronze_changed": True,
+        "batches_written": 1,
+        "records_ingested": 100,
+        "watermark": {
+            "last_crash_date": NEW_WATERMARK[0],
+            "last_collision_id": NEW_WATERMARK[1],
+        },
+    }
+
+
+def test_summary_reports_caught_up_after_short_batch():
+    short_batch = [{"collision_id": f"{i:032x}"} for i in range(40)]
+
+    result = run_main([short_batch])
+
+    assert result["caught_up"] is True
+    assert result["records_ingested"] == 40
+    assert result["batches_written"] == 1
+    assert result["bronze_changed"] is True
+
+
+def test_summary_reports_not_caught_up_at_time_budget():
+    full_batch = [{"collision_id": f"{i:032x}"} for i in range(100)]
+
+    with patch.object(
+        ingest_collisions.time,
+        "monotonic",
+        side_effect=[0, 0, ingest_collisions.MAX_INGESTION_SECONDS],
+    ):
+        result = run_main([full_batch])
+
+    # A full batch followed by a time stop means more may remain.
+    assert result["caught_up"] is False
+    assert result["batches_written"] == 1
+    assert result["bronze_changed"] is True
+
+
+def test_summary_reports_not_caught_up_when_lambda_time_is_low():
+    from unittest.mock import Mock
+
+    context = Mock()
+    context.get_remaining_time_in_millis.return_value = 45000
+
+    result = run_main([], context=context)
+
+    # Nothing was fetched, so the watermark is unchanged.
+    assert result == {
+        "caught_up": False,
+        "bronze_changed": False,
+        "batches_written": 0,
+        "records_ingested": 0,
+        "watermark": {
+            "last_crash_date": OLD_WATERMARK[0],
+            "last_collision_id": OLD_WATERMARK[1],
+        },
+    }
+
+
+def test_summary_counts_only_new_files():
+    full_batch = [{"collision_id": f"{i:032x}"} for i in range(100)]
+
+    # The first batch already existed in S3, so only the second is new.
+    result = run_main(
+        [full_batch, full_batch, []],
+        upload_side_effect=[False, True],
+    )
+
+    assert result["records_ingested"] == 200
+    assert result["batches_written"] == 1
+    assert result["bronze_changed"] is True
+
+
+def test_summary_reports_no_bronze_change_when_already_caught_up():
+    result = run_main([[]])
+
+    assert result["caught_up"] is True
+    assert result["batches_written"] == 0
+    assert result["bronze_changed"] is False
+
+
+def test_bronze_unchanged_when_every_batch_already_existed():
+    full_batch = [{"collision_id": f"{i:032x}"} for i in range(100)]
+
+    # A rerun re-fetches batches that are already in S3 unchanged.
+    result = run_main([full_batch, []], upload_side_effect=[False])
+
+    assert result["records_ingested"] == 100
+    assert result["batches_written"] == 0
+    assert result["bronze_changed"] is False
