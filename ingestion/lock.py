@@ -8,6 +8,7 @@ from botocore.exceptions import ClientError
 
 LOCK_ID = "nyc_collision_ingestion"
 LOCK_DURATION_SECONDS = 600
+PIPELINE_LOCK_ID = "nyc_collision_pipeline"
 
 def get_lock_table():
     '''

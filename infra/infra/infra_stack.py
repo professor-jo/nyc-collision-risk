@@ -33,7 +33,9 @@ from aws_cdk import (
     aws_dynamodb as dynamodb,
     aws_iam as iam,
     aws_glue as glue,
-    aws_s3_deployment as s3deploy
+    aws_s3_deployment as s3deploy,
+    aws_stepfunctions as sfn,
+    aws_stepfunctions_tasks as tasks,
 )
 
 from constructs import Construct
@@ -375,4 +377,110 @@ class InfraStack(Stack):
                     ],
                 )
             ],
+        )
+
+        # ============================================================
+        # P3.3 — Pipeline-level concurrency lock
+        # ============================================================
+
+        # This lock belongs to the whole Step Functions execution.
+        pipeline_lock_id = "nyc_collision_pipeline"
+
+        acquire_pipeline_lock = tasks.CallAwsService(
+            self,
+            "AcquirePipelineLock",
+            service="dynamodb",
+            action="putItem",
+            parameters={
+                "TableName": ingestion_lock_table.table_name,
+                "Item": {
+                    "lock_id": {
+                        "S": pipeline_lock_id
+                    },
+                    "owner_id": {
+                        "S.$": "$$.Execution.Id"
+                    },
+                },
+                "ConditionExpression": "attribute_not_exists(lock_id)",
+            },
+            iam_resources=[
+                ingestion_lock_table.table_arn
+            ],
+            result_path=sfn.JsonPath.DISCARD,
+        )
+
+        # Delete the lock only if this execution still owns it, so one
+        # execution can never remove another execution's lock.
+        release_pipeline_lock = tasks.CallAwsService(
+            self,
+            "ReleasePipelineLock",
+            service="dynamodb",
+            action="deleteItem",
+            parameters={
+                "TableName": ingestion_lock_table.table_name,
+                "Key": {
+                    "lock_id": {
+                        "S": pipeline_lock_id
+                    },
+                },
+                "ConditionExpression": "owner_id = :owner",
+                "ExpressionAttributeValues": {
+                    ":owner": {
+                        "S.$": "$$.Execution.Id"
+                    },
+                },
+            },
+            iam_resources=[
+                ingestion_lock_table.table_arn
+            ],
+            result_path=sfn.JsonPath.DISCARD,
+        )
+
+        lock_test_succeeded = sfn.Succeed(
+            self,
+            "LockTestSucceeded",
+        )
+
+        lock_already_held = sfn.Fail(
+            self,
+            "LockAlreadyHeld",
+            error="PipelineLockUnavailable",
+            cause="Another pipeline execution already owns the lock.",
+        )
+
+        # If acquisition fails because the lock is held,
+        # route to an explicit failure state.
+        acquire_pipeline_lock.add_catch(
+            lock_already_held,
+            errors=[
+                "DynamoDb.ConditionalCheckFailedException"
+            ],
+            result_path="$.lock_error",
+        )
+
+        # Test only: hold the lock long enough for a second execution,
+        # started a few seconds later, to find it held. Replace this with
+        # the real pipeline tasks.
+        hold_lock_for_test = sfn.Wait(
+            self,
+            "HoldLockForTest",
+            time=sfn.WaitTime.duration(Duration.seconds(60)),
+        )
+
+        # Happy path: acquire, hold, release, succeed.
+        lock_definition = (
+            acquire_pipeline_lock
+            .next(hold_lock_for_test)
+            .next(release_pipeline_lock)
+            .next(lock_test_succeeded)
+        )
+
+        pipeline_lock_state_machine = sfn.StateMachine(
+            self,
+            "PipelineLockTestStateMachine",
+            state_machine_name="nyc-collision-lock-test",
+            definition_body=sfn.DefinitionBody.from_chainable(
+                lock_definition
+            ),
+            timeout=Duration.minutes(2),
         )
