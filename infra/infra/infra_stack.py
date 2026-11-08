@@ -386,7 +386,22 @@ class InfraStack(Stack):
         # This lock belongs to the whole Step Functions execution.
         pipeline_lock_id = "nyc_collision_pipeline"
 
-        acquire_pipeline_lock = tasks.CallAwsService(
+        # A stopped or timed-out execution can't run its release step, so
+        # the lock must expire on its own. It outlives the execution by
+        # 5 minutes, the longest a Lambda already running can continue.
+        pipeline_timeout = Duration.minutes(45)
+        pipeline_lock_seconds = (
+            pipeline_timeout.to_seconds() + Duration.minutes(5).to_seconds()
+        )
+
+        # Epoch seconds, the same format ingestion/lock.py uses.
+        # This needs JSONata: classic JSONPath has no date functions.
+        lock_now = (
+            "$floor($toMillis($states.context.State.EnteredTime) / 1000)"
+        )
+
+        # Acquire when no lock exists, or take over one that has expired.
+        acquire_pipeline_lock = tasks.CallAwsService.jsonata(
             self,
             "AcquirePipelineLock",
             service="dynamodb",
@@ -398,38 +413,54 @@ class InfraStack(Stack):
                         "S": pipeline_lock_id
                     },
                     "owner_id": {
-                        "S.$": "$$.Execution.Id"
+                        "S": "{% $states.context.Execution.Id %}"
+                    },
+                    "expires_at": {
+                        "N": (
+                            f"{{% $string({lock_now} + "
+                            f"{pipeline_lock_seconds:.0f}) %}}"
+                        )
                     },
                 },
-                "ConditionExpression": "attribute_not_exists(lock_id)",
+                "ConditionExpression": (
+                    "attribute_not_exists(lock_id) OR expires_at < :now"
+                ),
+                "ExpressionAttributeValues": {
+                    ":now": {
+                        "N": f"{{% $string({lock_now}) %}}"
+                    },
+                },
             },
             iam_resources=[
                 ingestion_lock_table.table_arn
             ],
-            result_path=sfn.JsonPath.DISCARD,
+            # Pass the execution input through to the next state.
+            outputs="{% $states.input %}",
         )
 
         # Delete the lock only if this execution still owns it, so one
         # execution can never remove another execution's lock.
+        release_lock_parameters = {
+            "TableName": ingestion_lock_table.table_name,
+            "Key": {
+                "lock_id": {
+                    "S": pipeline_lock_id
+                },
+            },
+            "ConditionExpression": "owner_id = :owner",
+            "ExpressionAttributeValues": {
+                ":owner": {
+                    "S.$": "$$.Execution.Id"
+                },
+            },
+        }
+
         release_pipeline_lock = tasks.CallAwsService(
             self,
             "ReleasePipelineLock",
             service="dynamodb",
             action="deleteItem",
-            parameters={
-                "TableName": ingestion_lock_table.table_name,
-                "Key": {
-                    "lock_id": {
-                        "S": pipeline_lock_id
-                    },
-                },
-                "ConditionExpression": "owner_id = :owner",
-                "ExpressionAttributeValues": {
-                    ":owner": {
-                        "S.$": "$$.Execution.Id"
-                    },
-                },
-            },
+            parameters=release_lock_parameters,
             iam_resources=[
                 ingestion_lock_table.table_arn
             ],
@@ -455,8 +486,184 @@ class InfraStack(Stack):
             errors=[
                 "DynamoDb.ConditionalCheckFailedException"
             ],
-            result_path="$.lock_error",
         )
+
+        initialize_ingestion = sfn.Pass(
+            self,
+            "InitializeIngestion",
+            parameters={
+                "attempt": 1,
+                "max_attempts": 5,
+                "bronze_changed_any": False,
+            },
+            result_path="$.ingestion_state",
+        )
+
+        invoke_ingestion = tasks.LambdaInvoke(
+            self,
+            "InvokeCollisionIngestion",
+            lambda_function=ingestion_lambda,
+            payload=sfn.TaskInput.from_object({
+                "attempt": sfn.JsonPath.number_at(
+                    "$.ingestion_state.attempt"
+                ),
+                "max_attempts": sfn.JsonPath.number_at(
+                    "$.ingestion_state.max_attempts"
+                ),
+            }),
+            payload_response_only=True,
+            result_path="$.ingestion_result",
+        )
+
+        check_bronze_changed = sfn.Choice(
+            self,
+            "CheckBronzeChanged",
+        )
+
+        mark_bronze_changed = sfn.Pass(
+            self,
+            "MarkBronzeChanged",
+            result=sfn.Result.from_boolean(True),
+            result_path="$.ingestion_state.bronze_changed_any",
+        )
+
+        check_caught_up = sfn.Choice(
+    self,
+    "CheckCaughtUp",
+)
+
+        check_attempt_limit = sfn.Choice(
+            self,
+            "CheckAttemptLimit",
+        )
+
+        increment_attempt = sfn.Pass(
+            self,
+            "IncrementAttempt",
+            parameters={
+                "attempt.$": "States.MathAdd($.ingestion_state.attempt, 1)",
+                "max_attempts.$": "$.ingestion_state.max_attempts",
+                "bronze_changed_any.$": "$.ingestion_state.bronze_changed_any",
+            },
+            result_path="$.ingestion_state",
+        )
+
+        ingestion_complete = sfn.Pass(
+            self,
+            "IngestionComplete",
+            result=sfn.Result.from_boolean(True),
+            result_path="$.ingestion_state.caught_up",
+        )
+
+        ingestion_incomplete = sfn.Pass(
+            self,
+            "IngestionIncomplete",
+            result=sfn.Result.from_boolean(False),
+            result_path="$.ingestion_state.caught_up",
+        )
+
+        # If Lambda changed Bronze, remember it.
+        check_bronze_changed.when(
+            sfn.Condition.boolean_equals(
+                "$.ingestion_result.bronze_changed",
+                True,
+            ),
+            mark_bronze_changed,
+        )
+
+        # Otherwise, keep the previous cumulative value.
+        check_bronze_changed.otherwise(check_caught_up)
+
+        # After marking Bronze changed, check ingestion progress.
+        mark_bronze_changed.next(check_caught_up)
+
+
+        # If ingestion caught up, mark it complete.
+        check_caught_up.when(
+            sfn.Condition.boolean_equals(
+                "$.ingestion_result.caught_up",
+                True,
+            ),
+            ingestion_complete,
+        )
+
+        # Otherwise, check whether another attempt is allowed.
+        check_caught_up.otherwise(check_attempt_limit)
+
+
+        # Stop after five attempts.
+        check_attempt_limit.when(
+            sfn.Condition.number_greater_than_equals(
+                "$.ingestion_state.attempt",
+                5,
+            ),
+            ingestion_incomplete,
+        )
+
+        # Otherwise, increment the counter and invoke Lambda again.
+        check_attempt_limit.otherwise(increment_attempt)
+
+        increment_attempt.next(invoke_ingestion)
+
+        # After each Lambda invocation, check whether Bronze changed.
+        invoke_ingestion.next(check_bronze_changed)
+
+        # ------------------------------------------------------------
+        # P3.5 — Lambda failure path
+        # ------------------------------------------------------------
+
+        # The execution ends with the original Lambda error, so the
+        # console shows IngestionLockHeld rather than a generic failure.
+        ingestion_failed = sfn.Fail(
+            self,
+            "IngestionFailed",
+            error_path="$.ingestion_error.Error",
+            cause_path="$.ingestion_error.Cause",
+        )
+
+        # A separate state from ReleasePipelineLock, because a state has
+        # only one next step and this path must end in failure.
+        release_lock_after_failure = tasks.CallAwsService(
+            self,
+            "ReleasePipelineLockAfterFailure",
+            service="dynamodb",
+            action="deleteItem",
+            parameters=release_lock_parameters,
+            iam_resources=[
+                ingestion_lock_table.table_arn
+            ],
+            result_path=sfn.JsonPath.DISCARD,
+        )
+
+        # A brief DynamoDB error must not leave the lock held.
+        release_lock_after_failure.add_retry(
+            errors=["States.ALL"],
+            interval=Duration.seconds(2),
+            max_attempts=3,
+            backoff_rate=2,
+        )
+
+        # If the release still fails, report the Lambda error anyway.
+        # A separate result_path keeps $.ingestion_error intact.
+        release_lock_after_failure.add_catch(
+            ingestion_failed,
+            errors=["States.ALL"],
+            result_path="$.release_error",
+        )
+
+        release_lock_after_failure.next(ingestion_failed)
+
+        # Runs after the Lambda service retries on the task are used up.
+        invoke_ingestion.add_catch(
+            release_lock_after_failure,
+            errors=["States.ALL"],
+            result_path="$.ingestion_error",
+        )
+
+
+
+
+        
 
         # Test only: hold the lock long enough for a second execution,
         # started a few seconds later, to find it held. Replace this with
@@ -470,10 +677,52 @@ class InfraStack(Stack):
         # Happy path: acquire, hold, release, succeed.
         lock_definition = (
             acquire_pipeline_lock
-            .next(hold_lock_for_test)
-            .next(release_pipeline_lock)
-            .next(lock_test_succeeded)
+            .next(initialize_ingestion)
+            .next(invoke_ingestion)
         )
+
+        ingestion_complete.next(release_pipeline_lock)
+        ingestion_incomplete.next(release_pipeline_lock)
+
+        check_final_outcome = sfn.Choice(
+            self,
+            "CheckFinalOutcome",
+        )
+
+        ingestion_not_caught_up = sfn.Fail(
+            self,
+            "IngestionNotCaughtUp",
+            error="IngestionIncomplete",
+            cause="Ingestion did not catch up within five attempts.",
+        )
+
+        release_pipeline_lock.next(check_final_outcome)
+
+        # A brief DynamoDB error must not fail a run whose work is done.
+        release_pipeline_lock.add_retry(
+            errors=["States.ALL"],
+            interval=Duration.seconds(2),
+            max_attempts=3,
+            backoff_rate=2,
+        )
+
+        # The lock is already gone or no longer ours, which also happens
+        # when a retry follows a delete that had actually succeeded.
+        release_pipeline_lock.add_catch(
+            check_final_outcome,
+            errors=["DynamoDb.ConditionalCheckFailedException"],
+            result_path="$.release_error",
+        )
+
+        check_final_outcome.when(
+            sfn.Condition.boolean_equals(
+                "$.ingestion_state.caught_up",
+                True,
+            ),
+            lock_test_succeeded,
+        )
+
+        check_final_outcome.otherwise(ingestion_not_caught_up)
 
         pipeline_lock_state_machine = sfn.StateMachine(
             self,
@@ -482,5 +731,5 @@ class InfraStack(Stack):
             definition_body=sfn.DefinitionBody.from_chainable(
                 lock_definition
             ),
-            timeout=Duration.minutes(2),
+            timeout=pipeline_timeout,
         )

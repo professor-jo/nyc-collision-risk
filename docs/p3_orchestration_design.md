@@ -110,7 +110,7 @@ EventBridge (00:00 UTC) ──► Step Functions: nyc-collision-pipeline
                  Choice: caught_up? ─no (≤ 5 loops)─► Ingest │
                                   │ yes                      │
                                   ▼                          │
-        Choice: files_written > 0 or run_silver? ─no─► Release ► Succeed("no new data")
+        Choice: bronze_changed_any or run_silver? ─no─► Release ► Succeed("no new data")
                                   │ yes                      │
                                   ▼ ◄────────────────────────┘
                  RunSilver (glue:startJobRun.sync)
@@ -136,17 +136,16 @@ Return a structured result, and raise instead of returning an error code:
 
 ```json
 {
-  "status": "ingested | caught_up",
-  "records_ingested": 312,
-  "files_written": 4,
-  "caught_up": true,
-  "lookback_status": "complete | incomplete | skipped",
-  "watermark": {"last_crash_date": "...", "last_collision_id": "..."}
+  "statusCode": 200,
+  "caught_up": false,
+  "bronze_changed": true,
+  "lookback_ran": false,
+  "lookback_complete": null
 }
 ```
 
 - A held Lambda lock raises a named error, `IngestionLockHeld`, so Step Functions can catch it.
-- An incomplete lookback is still a success, as now. The next run replays the window, and the existing three-day alarm stays.
+- An incomplete lookback is still a success, as now, and so is a lookback that raises an error. The next run replays the window, and the existing three-day alarm stays.
 
 ### Glue
 - Success: the job run is `SUCCEEDED`.
@@ -163,7 +162,7 @@ Use layered defenses. Each layer covers a gap in the others.
 
 1. **Deterministic execution names.** `scheduled-<run_date>` stops the same day from running twice, even if EventBridge delivers the event twice.
 2. **Pipeline lock.** A DynamoDB item `lock_id = nyc_collision_pipeline`, held by the state machine from start to finish.
-   - TTL 30 minutes, longer than up to 5 Lambda loops plus a 10-minute Glue run, with margin.
+   - Expires after 50 minutes: the 45-minute workflow timeout plus 5 minutes for a Lambda that's still running. A new execution can take over an expired lock, which recovers from stopped or timed-out executions.
    - It stops a manual replay or backfill from overlapping a scheduled run, which execution names alone can't do.
    - Use the existing lock table with a new `lock_id`.
 3. **Keep the Lambda lock.** It still protects direct invocations outside Step Functions, such as testing with `aws lambda invoke`.
@@ -188,13 +187,14 @@ Use layered defenses. Each layer covers a gap in the others.
 | 3. Pipeline lock already held? | Scheduled: `Succeed("skipped")`. Manual: `Fail` | Avoid noisy scheduled alerts while making manual conflicts visible |
 
 ### What each decision means for the build
-1. **Silver gate:** after ingestion, a `Choice` state runs Silver only when `files_written > 0` across all loops, or when `mode == replay`.
-   - `files_written` must count lookback and backfill files as well as incremental ones, so late-arriving records still reach Silver.
+1. **Silver gate:** after ingestion and before the lock is released, a `Choice` state runs Silver only when `bronze_changed_any` is true, or when `mode == replay`.
+   - `bronze_changed` must include lookback and backfill writes as well as incremental ones, so late-arriving records still reach Silver.
+   - Silver also runs when ingestion didn't catch up, so data from those attempts isn't stranded in Bronze.
    - The `run_silver` input can force a run in any mode.
 2. **Catch-up loop:** a counter in the execution state starts at 1. After each `Ingest`, loop again while `caught_up == false` and the counter is below 5.
-   - Each Lambda run takes about 4 minutes, so the worst case is about 20 minutes. This fits inside the pipeline lock's 30-minute TTL, together with a 10-minute Glue run.
-   - A backlog still unfinished after 5 runs isn't a failure. The next day continues from the watermark.
-   - The lookback should run only on the final loop, so it isn't repeated up to 5 times.
+   - Each Lambda run takes about 4 minutes, so the worst case is about 20 minutes. This fits inside the 45-minute workflow timeout, together with a 10-minute Glue run.
+   - A backlog still unfinished after 5 runs releases the lock and ends in `Fail` with error `IngestionIncomplete`, so a stuck backlog is visible. The next day continues from the watermark.
+   - The lookback runs once, when ingestion has caught up or on the final attempt, so it isn't repeated up to 5 times.
 3. **Held lock:**
    - For `mode == scheduled`, `AcquirePipelineLock`'s `ConditionalCheckFailedException` goes to `Succeed` with output `{"result": "skipped"}`. No email is sent.
-   - For `replay` and `backfill`, it goes to `Fail` with error `PipelineLockHeld`, which triggers the failure alarm.
+   - For `replay` and `backfill`, it goes to `Fail` with error `PipelineLockUnavailable`, which triggers the failure alarm.
