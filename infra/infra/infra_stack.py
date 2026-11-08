@@ -34,6 +34,7 @@ from aws_cdk import (
     aws_iam as iam,
     aws_glue as glue,
     aws_s3_deployment as s3deploy,
+    aws_sqs as sqs,
     aws_stepfunctions as sfn,
     aws_stepfunctions_tasks as tasks,
 )
@@ -160,6 +161,10 @@ class InfraStack(Stack):
             timeout=10,
             # Prevents automatic reruns during development.
             max_retries=0,
+            # A backstop if something starts the job outside the pipeline.
+            execution_property=glue.CfnJob.ExecutionPropertyProperty(
+                max_concurrent_runs=1,
+            ),
 
 
             # This passes Bronze S3 bucket name into the Glue job as
@@ -295,10 +300,6 @@ class InfraStack(Stack):
             ),
             enabled=True,
             description="Run NYC collision ingestion daily at 00:00 UTC",
-        )
-
-        ingestion_rule.add_target(
-            targets.LambdaFunction(ingestion_lambda)
         )
 
 
@@ -467,9 +468,9 @@ class InfraStack(Stack):
             result_path=sfn.JsonPath.DISCARD,
         )
 
-        lock_test_succeeded = sfn.Succeed(
+        pipeline_succeeded = sfn.Succeed(
             self,
-            "LockTestSucceeded",
+            "PipelineSucceeded",
         )
 
         lock_already_held = sfn.Fail(
@@ -690,15 +691,6 @@ class InfraStack(Stack):
 
         
 
-        # Test only: hold the lock long enough for a second execution,
-        # started a few seconds later, to find it held. Replace this with
-        # the real pipeline tasks.
-        hold_lock_for_test = sfn.Wait(
-            self,
-            "HoldLockForTest",
-            time=sfn.WaitTime.duration(Duration.seconds(60)),
-        )
-
         # ------------------------------------------------------------
         # P3.7 — Conditional Silver job
         # ------------------------------------------------------------
@@ -838,7 +830,7 @@ class InfraStack(Stack):
 
         validate_run_input.otherwise(acquire_pipeline_lock)
 
-        lock_definition = validate_run_input
+        pipeline_definition = validate_run_input
 
         check_final_outcome = sfn.Choice(
             self,
@@ -875,17 +867,17 @@ class InfraStack(Stack):
                 "$.ingestion_state.caught_up",
                 True,
             ),
-            lock_test_succeeded,
+            pipeline_succeeded,
         )
 
         check_final_outcome.otherwise(ingestion_not_caught_up)
 
-        pipeline_lock_state_machine = sfn.StateMachine(
+        pipeline_state_machine = sfn.StateMachine(
             self,
-            "PipelineLockTestStateMachine",
-            state_machine_name="nyc-collision-lock-test",
+            "PipelineStateMachine",
+            state_machine_name="nyc-collision-pipeline",
             definition_body=sfn.DefinitionBody.from_chainable(
-                lock_definition
+                pipeline_definition
             ),
             timeout=pipeline_timeout,
         )
@@ -900,11 +892,11 @@ class InfraStack(Stack):
         # them, and a skipped scheduled run counts as a success.
         pipeline_alarms = {
             "PipelineExecutionsFailedAlarm": (
-                pipeline_lock_state_machine.metric_failed,
+                pipeline_state_machine.metric_failed,
                 "NYC collision pipeline execution failed",
             ),
             "PipelineExecutionsTimedOutAlarm": (
-                pipeline_lock_state_machine.metric_timed_out,
+                pipeline_state_machine.metric_timed_out,
                 "NYC collision pipeline execution timed out",
             ),
         }
@@ -926,3 +918,51 @@ class InfraStack(Stack):
             pipeline_alarm.add_alarm_action(
                 cw_actions.SnsAction(alert_topic)
             )
+
+        # ------------------------------------------------------------
+        # P3 — Daily schedule
+        # ------------------------------------------------------------
+
+        # Holds schedule events that EventBridge could not deliver, such
+        # as when the workflow cannot be started at all.
+        schedule_dead_letter_queue = sqs.Queue(
+            self,
+            "PipelineScheduleDeadLetterQueue",
+            retention_period=Duration.days(14),
+            enforce_ssl=True,
+        )
+
+        # The state machine is the only target. Keeping the Lambda as
+        # well would run ingestion twice each day.
+        ingestion_rule.add_target(
+            targets.SfnStateMachine(
+                pipeline_state_machine,
+                input=events.RuleTargetInput.from_object({
+                    "trigger": "scheduled",
+                }),
+                dead_letter_queue=schedule_dead_letter_queue,
+                retry_attempts=2,
+            )
+        )
+
+        # A message in this queue means a daily run never started, which
+        # the execution alarms can't see.
+        schedule_delivery_alarm = cloudwatch.Alarm(
+            self,
+            "PipelineScheduleDeliveryAlarm",
+            metric=(
+                schedule_dead_letter_queue
+                .metric_approximate_number_of_messages_visible(
+                    period=Duration.minutes(5),
+                    statistic="Maximum",
+                )
+            ),
+            threshold=1,
+            evaluation_periods=1,
+            alarm_description="NYC collision pipeline schedule failed to start",
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        )
+
+        schedule_delivery_alarm.add_alarm_action(
+            cw_actions.SnsAction(alert_topic)
+        )

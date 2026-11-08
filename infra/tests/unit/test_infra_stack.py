@@ -215,7 +215,7 @@ def test_shared_release_separates_complete_from_incomplete(template):
     assert outcome["Choices"] == [{
         "Variable": "$.ingestion_state.caught_up",
         "BooleanEquals": True,
-        "Next": "LockTestSucceeded",
+        "Next": "PipelineSucceeded",
     }]
     assert outcome["Default"] == "IngestionNotCaughtUp"
 
@@ -377,7 +377,7 @@ def test_caught_up_with_bronze_changes_runs_silver(template):
     visited, data = run_workflow(template, [ingestion(True, True)])
 
     assert visited.index("RunSilverJob") < visited.index("ReleasePipelineLock")
-    assert visited[-1] == "LockTestSucceeded"
+    assert visited[-1] == "PipelineSucceeded"
     assert "ReleasePipelineLockAfterFailure" not in visited
     assert data["ingestion_state"]["bronze_changed_any"] is True
 
@@ -387,7 +387,7 @@ def test_caught_up_without_changes_skips_silver(template):
 
     assert "RunSilverJob" not in visited
     assert "ReleasePipelineLock" in visited
-    assert visited[-1] == "LockTestSucceeded"
+    assert visited[-1] == "PipelineSucceeded"
 
 
 def test_incomplete_with_changes_runs_silver_then_fails(template):
@@ -500,7 +500,7 @@ def test_replay_skips_ingestion_and_runs_silver(template):
     assert "InvokeBackfill" not in visited
     assert visited.index("AcquirePipelineLock") < visited.index("RunSilverJob")
     assert visited.index("RunSilverJob") < visited.index("ReleasePipelineLock")
-    assert visited[-1] == "LockTestSucceeded"
+    assert visited[-1] == "PipelineSucceeded"
 
 
 def test_replay_failure_releases_lock_and_keeps_the_error(template):
@@ -527,7 +527,7 @@ def test_backfill_with_changes_runs_silver_once(template):
     assert visited.count("InvokeBackfill") == 1
     assert "InvokeCollisionIngestion" not in visited
     assert "RunSilverJob" in visited
-    assert visited[-1] == "LockTestSucceeded"
+    assert visited[-1] == "PipelineSucceeded"
 
 
 def test_backfill_without_changes_skips_silver(template):
@@ -538,7 +538,7 @@ def test_backfill_without_changes_skips_silver(template):
     )
 
     assert "RunSilverJob" not in visited
-    assert visited[-1] == "LockTestSucceeded"
+    assert visited[-1] == "PipelineSucceeded"
 
 
 def test_backfill_failure_releases_the_lock(template):
@@ -572,3 +572,48 @@ def test_backfill_payload_reaches_the_lambda(template):
         "backfill_start.$": "$.backfill_start",
         "backfill_end.$": "$.backfill_end",
     }
+
+
+def test_state_machine_has_its_production_name(template):
+    template.has_resource_properties("AWS::StepFunctions::StateMachine", {
+        "StateMachineName": "nyc-collision-pipeline",
+    })
+
+
+def test_glue_job_allows_one_concurrent_run(template):
+    template.has_resource_properties("AWS::Glue::Job", {
+        "Name": "nyc-collision-silver-etl",
+        "ExecutionProperty": {"MaxConcurrentRuns": 1},
+    })
+
+
+def test_schedule_starts_only_the_state_machine(template):
+    rules = template.find_resources("AWS::Events::Rule")
+    assert len(rules) == 1
+    rule = next(iter(rules.values()))["Properties"]
+
+    assert rule["ScheduleExpression"] == "cron(0 0 * * ? *)"
+    assert len(rule["Targets"]) == 1
+
+    target = rule["Targets"][0]
+    assert "PipelineStateMachine" in target["Arn"]["Ref"]
+    assert json.loads(target["Input"]) == {"trigger": "scheduled"}
+    assert "DeadLetterConfig" in target
+    assert target["RetryPolicy"]["MaximumRetryAttempts"] == 2
+
+
+def test_eventbridge_can_no_longer_invoke_the_lambda(template):
+    permissions = template.find_resources("AWS::Lambda::Permission", {
+        "Properties": {"Principal": "events.amazonaws.com"},
+    })
+
+    assert permissions == {}
+
+
+def test_undelivered_schedule_events_raise_an_alarm(template):
+    template.resource_count_is("AWS::SQS::Queue", 1)
+    template.has_resource_properties("AWS::CloudWatch::Alarm", {
+        "MetricName": "ApproximateNumberOfMessagesVisible",
+        "Namespace": "AWS/SQS",
+        "Threshold": 1,
+    })
