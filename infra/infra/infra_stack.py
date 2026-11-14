@@ -1114,6 +1114,48 @@ class InfraStack(Stack):
             iam_roles=[redshift_role.role_arn],
         )
 
+        # Find, then Reference the existing default VPC
+        vpc = ec2.Vpc.from_lookup(
+            self,
+            "ExistingVpc",
+            is_default=True,
+        )
+
+        # Select subnets across three AZs
+        selected_subnets = vpc.select_subnets(
+            subnet_type=ec2.SubnetType.PUBLIC,
+            one_per_az=True,
+        ).subnet_ids[:3]
+
+#----------------------------------------------------------------------#
+# This creates a firewall rule allowing SQL connections only from
+# the specified IPv4 address.
+
+        # Security group for Redshift database connections
+        redshift_sg = ec2.SecurityGroup(
+            self,
+            "RedshiftSecurityGroup",
+            vpc=vpc,
+            description="Restrict Redshift SQL Access",
+            allow_all_outbound=True,
+        )
+
+        # Your public IP, supplied through CDK context
+        developer_ip = self.node.try_get_context("developer_ip")
+
+        if not developer_ip:
+            raise ValueError(
+                "Missing developer_ip CDK Context"
+            )
+
+        redshift_sg.add_ingress_rule(
+            peer=ec2.Peer.ipv4(f"{developer_ip}/32"),
+            connection=ec2.Port.tcp(5439),
+            description="Local dbt development access",
+        )
+#----------------------------------------------------------------------#
+
+
         # Create the Redshift workgroup
         redshift_workgroup = redshiftserverless.CfnWorkgroup(
             self,
@@ -1121,11 +1163,11 @@ class InfraStack(Stack):
             workgroup_name="nyc-collision-workgroup",
             namespace_name=redshift_namespace.namespace_name,
             base_capacity=4,
-            # Reachable from the internet, but the security group only
-            # admits dbt_client_cidr on port 5439.
             publicly_accessible=True,
-            subnet_ids=[subnet.ref for subnet in warehouse_subnets],
-            security_group_ids=[warehouse_security_group.attr_group_id],
+            subnet_ids=selected_subnets,
+            security_group_ids=[
+                redshift_sg.security_group_id
+            ],
         )
 
         redshift_workgroup.add_dependency(redshift_namespace)
