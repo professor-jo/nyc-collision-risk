@@ -671,3 +671,113 @@ def test_stack_refuses_a_missing_or_wide_dbt_client_cidr(cidr):
 
     with pytest.raises(ValueError, match="dbt_client_cidr"):
         InfraStack(app, "RejectedStack")
+
+
+def test_redshift_namespace_manages_its_own_admin_password(template):
+    namespace = next(iter(
+        template.find_resources("AWS::RedshiftServerless::Namespace").values()
+    ))["Properties"]
+
+    assert namespace["ManageAdminPassword"] is True
+    assert namespace["AdminUsername"]
+    assert "AdminUserPassword" not in namespace
+    # Spectrum can use IAM_ROLE default.
+    assert namespace["DefaultIamRoleArn"] in namespace["IamRoles"]
+
+
+def test_redshift_workgroup_cannot_scale_past_its_base_capacity(template):
+    workgroup = next(iter(
+        template.find_resources("AWS::RedshiftServerless::Workgroup").values()
+    ))["Properties"]
+
+    assert workgroup["BaseCapacity"] == 4
+    assert workgroup["MaxCapacity"] == workgroup["BaseCapacity"]
+
+
+def test_warehouse_vpc_has_no_unused_s3_endpoint(template):
+    template.resource_count_is("AWS::EC2::VPCEndpoint", 0)
+
+
+def _usage_limit_calls(template):
+    resources = template.find_resources("Custom::AWS")
+    limits = {
+        logical_id: resource
+        for logical_id, resource in resources.items()
+        if "UsageLimit" in logical_id
+    }
+    assert len(limits) == 1
+    resource = next(iter(limits.values()))
+
+    def decode(payload):
+        # Create embeds the workgroup ARN token, so it is an Fn::Join.
+        if isinstance(payload, dict):
+            payload = "".join(
+                part if isinstance(part, str) else "WORKGROUP_ARN"
+                for part in payload["Fn::Join"][1]
+            )
+        return json.loads(payload)
+
+    properties = resource["Properties"]
+    return resource, {
+        event: decode(properties[event])
+        for event in ("Create", "Update", "Delete")
+    }
+
+
+def test_usage_limit_deactivates_the_workgroup_after_ten_rpu_hours(template):
+    _, calls = _usage_limit_calls(template)
+    create = calls["Create"]
+
+    assert create["service"] == "redshift-serverless"
+    assert create["action"] == "createUsageLimit"
+    assert create["parameters"] == {
+        "resourceArn": "WORKGROUP_ARN",
+        "usageType": "serverless-compute",
+        "period": "monthly",
+        "amount": 10,
+        "breachAction": "deactivate",
+    }
+    assert create["physicalResourceId"] == {
+        "responsePath": "usageLimit.usageLimitId"
+    }
+
+
+def test_usage_limit_lifecycle_updates_and_deletes_the_same_limit(template):
+    resource, calls = _usage_limit_calls(template)
+    update, delete = calls["Update"], calls["Delete"]
+
+    # Update edits the created limit instead of creating a second one.
+    assert update["action"] == "updateUsageLimit"
+    assert update["parameters"]["usageLimitId"] == "PHYSICAL:RESOURCEID:"
+    assert update["parameters"]["amount"] == 10
+    assert update["parameters"]["breachAction"] == "deactivate"
+    assert update["physicalResourceId"] == {
+        "responsePath": "usageLimit.usageLimitId"
+    }
+
+    # Delete removes it, and tolerates it already being gone.
+    assert delete["action"] == "deleteUsageLimit"
+    assert delete["parameters"] == {"usageLimitId": "PHYSICAL:RESOURCEID:"}
+    assert delete["ignoreErrorCodesMatching"] == "ResourceNotFoundException"
+
+    # Created after the workgroup exists and deleted before it.
+    assert "CollisionWarehouseWorkgroup" in resource["DependsOn"]
+    assert resource["DeletionPolicy"] == "Delete"
+
+
+def test_usage_limit_custom_resource_can_only_manage_usage_limits(template):
+    policies = [
+        policy["Properties"]["PolicyDocument"]["Statement"]
+        for logical_id, policy in template.find_resources("AWS::IAM::Policy").items()
+        if logical_id.startswith("WarehouseComputeUsageLimit")
+    ]
+
+    assert policies == [[{
+        "Action": [
+            "redshift-serverless:CreateUsageLimit",
+            "redshift-serverless:UpdateUsageLimit",
+            "redshift-serverless:DeleteUsageLimit",
+        ],
+        "Effect": "Allow",
+        "Resource": "*",
+    }]]

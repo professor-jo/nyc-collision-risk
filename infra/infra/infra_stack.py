@@ -41,6 +41,7 @@ from aws_cdk import (
     aws_stepfunctions_tasks as tasks,
     aws_redshiftserverless as redshiftserverless,
     aws_ec2 as ec2,
+    custom_resources as cr,
 )
 
 from constructs import Construct
@@ -68,6 +69,11 @@ def validate_dbt_client_cidr(value):
             "ideally your own /32."
         )
     return str(network)
+
+# Redshift Serverless compute ceiling for development. At 4 RPU this is
+# about 2.5 hours of query time a month (roughly $3.75 in us-east-1).
+WAREHOUSE_BASE_RPU = 4
+WAREHOUSE_MONTHLY_RPU_HOURS = 10
 
 # Resolved from this file, so the stack synthesizes from any working directory.
 LAMBDA_PACKAGE_DIR = Path(__file__).resolve().parents[2] / "lambda_package"
@@ -1032,16 +1038,6 @@ class InfraStack(Stack):
         )
         warehouse_internet_route.add_dependency(warehouse_gateway_attachment)
 
-        # Keep S3 traffic (Spectrum reads of Silver) on the AWS network.
-        ec2.CfnVPCEndpoint(
-            self,
-            "WarehouseS3Endpoint",
-            vpc_id=warehouse_vpc.ref,
-            service_name=f"com.amazonaws.{self.region}.s3",
-            vpc_endpoint_type="Gateway",
-            route_table_ids=[warehouse_route_table.ref],
-        )
-
         warehouse_subnets = []
         for index in range(3):
             subnet = ec2.CfnSubnet(
@@ -1111,50 +1107,14 @@ class InfraStack(Stack):
             "CollisionWarehouseNamespace",
             namespace_name="nyc-collision-warehouse",
             db_name="collision_analytics",
+            # Redshift generates the password and keeps it in Secrets
+            # Manager, so it never appears in code or the template.
+            admin_username="warehouse_admin",
+            manage_admin_password=True,
             iam_roles=[redshift_role.role_arn],
+            # Lets SQL use IAM_ROLE default for Spectrum external schemas.
+            default_iam_role_arn=redshift_role.role_arn,
         )
-
-        # Find, then Reference the existing default VPC
-        vpc = ec2.Vpc.from_lookup(
-            self,
-            "ExistingVpc",
-            is_default=True,
-        )
-
-        # Select subnets across three AZs
-        selected_subnets = vpc.select_subnets(
-            subnet_type=ec2.SubnetType.PUBLIC,
-            one_per_az=True,
-        ).subnet_ids[:3]
-
-#----------------------------------------------------------------------#
-# This creates a firewall rule allowing SQL connections only from
-# the specified IPv4 address.
-
-        # Security group for Redshift database connections
-        redshift_sg = ec2.SecurityGroup(
-            self,
-            "RedshiftSecurityGroup",
-            vpc=vpc,
-            description="Restrict Redshift SQL Access",
-            allow_all_outbound=True,
-        )
-
-        # Your public IP, supplied through CDK context
-        developer_ip = self.node.try_get_context("developer_ip")
-
-        if not developer_ip:
-            raise ValueError(
-                "Missing developer_ip CDK Context"
-            )
-
-        redshift_sg.add_ingress_rule(
-            peer=ec2.Peer.ipv4(f"{developer_ip}/32"),
-            connection=ec2.Port.tcp(5439),
-            description="Local dbt development access",
-        )
-#----------------------------------------------------------------------#
-
 
         # Create the Redshift workgroup
         redshift_workgroup = redshiftserverless.CfnWorkgroup(
@@ -1162,14 +1122,81 @@ class InfraStack(Stack):
             "CollisionWarehouseWorkgroup",
             workgroup_name="nyc-collision-workgroup",
             namespace_name=redshift_namespace.namespace_name,
-            base_capacity=4,
+            base_capacity=WAREHOUSE_BASE_RPU,
+            # Stops a single heavy query from scaling past the base size.
+            max_capacity=WAREHOUSE_BASE_RPU,
+            # Reachable from the internet, but the security group only
+            # admits dbt_client_cidr on port 5439.
             publicly_accessible=True,
-            subnet_ids=selected_subnets,
-            security_group_ids=[
-                redshift_sg.security_group_id
-            ],
+            subnet_ids=[subnet.ref for subnet in warehouse_subnets],
+            security_group_ids=[warehouse_security_group.attr_group_id],
         )
 
         redshift_workgroup.add_dependency(redshift_namespace)
         # The public endpoint needs the internet route in place first.
         redshift_workgroup.add_dependency(warehouse_internet_route)
+
+        # CloudFormation has no usage-limit resource, so a custom resource
+        # calls the API. Past the monthly RPU-hours, Redshift deactivates
+        # the workgroup until the next month (or until the limit is raised).
+        usage_limit_settings = {
+            "amount": WAREHOUSE_MONTHLY_RPU_HOURS,
+            "breachAction": "deactivate",
+        }
+
+        warehouse_usage_limit = cr.AwsCustomResource(
+            self,
+            "WarehouseComputeUsageLimit",
+            on_create=cr.AwsSdkCall(
+                service="redshift-serverless",
+                action="createUsageLimit",
+                parameters={
+                    "resourceArn": redshift_workgroup.attr_workgroup_workgroup_arn,
+                    "usageType": "serverless-compute",
+                    "period": "monthly",
+                    **usage_limit_settings,
+                },
+                physical_resource_id=cr.PhysicalResourceId.from_response(
+                    "usageLimit.usageLimitId"
+                ),
+            ),
+            # Changing the amount or action edits the existing limit.
+            # usageType, period and resourceArn can't be updated; the
+            # workgroup name is fixed, so its ARN doesn't change.
+            on_update=cr.AwsSdkCall(
+                service="redshift-serverless",
+                action="updateUsageLimit",
+                parameters={
+                    "usageLimitId": cr.PhysicalResourceIdReference(),
+                    **usage_limit_settings,
+                },
+                physical_resource_id=cr.PhysicalResourceId.from_response(
+                    "usageLimit.usageLimitId"
+                ),
+            ),
+            # A limit already removed with its workgroup isn't an error.
+            on_delete=cr.AwsSdkCall(
+                service="redshift-serverless",
+                action="deleteUsageLimit",
+                parameters={
+                    "usageLimitId": cr.PhysicalResourceIdReference(),
+                },
+                ignore_error_codes_matching="ResourceNotFoundException",
+            ),
+            policy=cr.AwsCustomResourcePolicy.from_statements([
+                # Only usage-limit actions. Resource is "*" because the
+                # limit's ARN doesn't exist until it is created.
+                iam.PolicyStatement(
+                    actions=[
+                        "redshift-serverless:CreateUsageLimit",
+                        "redshift-serverless:UpdateUsageLimit",
+                        "redshift-serverless:DeleteUsageLimit",
+                    ],
+                    resources=["*"],
+                ),
+            ]),
+            install_latest_aws_sdk=False,
+        )
+
+        # Created after the workgroup, and deleted before it.
+        warehouse_usage_limit.node.add_dependency(redshift_workgroup)
