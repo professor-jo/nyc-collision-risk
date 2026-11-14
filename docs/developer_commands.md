@@ -46,7 +46,7 @@ The CDK rebuilds `lambda_package/` automatically before each of these commands.
 ### Synth
 
 ```bash
-cdk synth -c budget_email=you@example.com --profile nyc-capstone
+cdk synth -c budget_email=you@example.com -c dbt_client_cidr=$(curl -s https://checkip.amazonaws.com)/32 --profile nyc-capstone
 ```
 
 **What it does:** Converts your Python infrastructure code into an AWS CloudFormation template. It does not deploy anything. Use it to catch errors in the stack code early.
@@ -54,7 +54,7 @@ cdk synth -c budget_email=you@example.com --profile nyc-capstone
 ### Diff
 
 ```bash
-cdk diff -c budget_email=you@example.com --profile nyc-capstone
+cdk diff -c budget_email=you@example.com -c dbt_client_cidr=$(curl -s https://checkip.amazonaws.com)/32 --profile nyc-capstone
 ```
 
 **What it does:** Compares your local infrastructure code with what is currently deployed in AWS and lists every resource that would be added, changed or replaced. It does not deploy anything. Run it before every deploy, and pay attention to IAM changes and anything marked "may be replaced".
@@ -62,12 +62,14 @@ cdk diff -c budget_email=you@example.com --profile nyc-capstone
 ### Deploy
 
 ```bash
-cdk deploy -c budget_email=you@example.com --profile nyc-capstone
+cdk deploy -c budget_email=you@example.com -c dbt_client_cidr=$(curl -s https://checkip.amazonaws.com)/32 --profile nyc-capstone
 ```
 
 **What it does:** Applies your infrastructure code to AWS. It uploads the Lambda code and the Glue script, then updates the CloudFormation stack to create, change or delete resources. **This changes real resources.** If the changes widen IAM permissions, it asks you to confirm first.
 
 `budget_email` is where AWS Budgets and alarm emails are sent. The stack refuses to build without it.
+
+`dbt_client_cidr` is the only address allowed to reach the Redshift endpoint on port 5439, so local dbt can connect. The command fills in your current public IP. The stack refuses to build without it, and rejects anything wider than a /24. When your IP changes, deploy again to update the security group.
 
 ## 5. Run the Silver Glue job
 

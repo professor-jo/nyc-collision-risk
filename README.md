@@ -98,8 +98,8 @@ These ran against the deployed stack on November 8–9, 2026.
 
 ```bash
 cd infra
-cdk diff -c budget_email=you@example.com
-cdk deploy -c budget_email=you@example.com
+cdk diff -c budget_email=you@example.com -c dbt_client_cidr=$(curl -s https://checkip.amazonaws.com)/32
+cdk deploy -c budget_email=you@example.com -c dbt_client_cidr=$(curl -s https://checkip.amazonaws.com)/32
 ```
 
 Ingestion stops with an error if its checkpoint is missing, so a new environment needs one created once, after the first deploy. This command refuses to overwrite an existing checkpoint:

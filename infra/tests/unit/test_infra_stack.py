@@ -7,13 +7,20 @@ from aws_cdk.assertions import Match, Template
 from infra.infra_stack import InfraStack
 
 
+TEST_DBT_CLIENT_CIDR = "203.0.113.10/32"
+TEST_CONTEXT = {
+    "budget_email": "test@example.com",
+    "dbt_client_cidr": TEST_DBT_CLIENT_CIDR,
+}
+
+
 @pytest.fixture(scope="module")
 def template():
     """
     Synthesize the stack once and share the template 
     across all tests
     """
-    app = cdk.App(context={"budget_email": "test@example.com"})
+    app = cdk.App(context=TEST_CONTEXT)
     stack = InfraStack(app, "TestStack")
     return Template.from_stack(stack)
 
@@ -617,3 +624,50 @@ def test_undelivered_schedule_events_raise_an_alarm(template):
         "Namespace": "AWS/SQS",
         "Threshold": 1,
     })
+
+
+def test_redshift_port_is_open_only_to_the_dbt_client(template):
+    groups = template.find_resources("AWS::EC2::SecurityGroup")
+    rules = [
+        rule
+        for group in groups.values()
+        for rule in group["Properties"].get("SecurityGroupIngress", [])
+    ]
+    rules += [
+        resource["Properties"]
+        for resource in template.find_resources("AWS::EC2::SecurityGroupIngress").values()
+    ]
+
+    assert rules
+    for rule in rules:
+        assert rule.get("CidrIp") not in ("0.0.0.0/0", None)
+        assert rule.get("CidrIpv6") is None
+    assert [(r["FromPort"], r["ToPort"], r["CidrIp"]) for r in rules] == [
+        (5439, 5439, TEST_DBT_CLIENT_CIDR)
+    ]
+
+
+def test_redshift_workgroup_is_public_in_three_subnets(template):
+    workgroups = template.find_resources("AWS::RedshiftServerless::Workgroup")
+    assert len(workgroups) == 1
+    properties = next(iter(workgroups.values()))["Properties"]
+
+    assert properties["PubliclyAccessible"] is True
+    assert len(properties["SubnetIds"]) == 3
+    assert len(properties["SecurityGroupIds"]) == 1
+    template.resource_count_is("AWS::EC2::Subnet", 3)
+    template.resource_count_is("AWS::EC2::NatGateway", 0)
+
+
+@pytest.mark.parametrize(
+    "cidr",
+    [None, "", "0.0.0.0/0", "10.0.0.0/8", "203.0.113.0/23", "::/0", "not-an-ip", "203.0.113.10/24"],
+)
+def test_stack_refuses_a_missing_or_wide_dbt_client_cidr(cidr):
+    context = {"budget_email": "test@example.com"}
+    if cidr is not None:
+        context["dbt_client_cidr"] = cidr
+    app = cdk.App(context=context)
+
+    with pytest.raises(ValueError, match="dbt_client_cidr"):
+        InfraStack(app, "RejectedStack")

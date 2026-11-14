@@ -13,6 +13,7 @@
 # - Monitor incomplete lookback executions.
 # - Review AWS costs and service quotas periodically.
 
+import ipaddress
 from pathlib import Path
 
 from aws_cdk import (
@@ -21,6 +22,7 @@ from aws_cdk import (
     aws_sns as sns,
     aws_sns_subscriptions as subscriptions,
     Duration,
+    Fn,
     Stack,
     RemovalPolicy,
     Tags,
@@ -37,9 +39,35 @@ from aws_cdk import (
     aws_sqs as sqs,
     aws_stepfunctions as sfn,
     aws_stepfunctions_tasks as tasks,
+    aws_redshiftserverless as redshiftserverless,
+    aws_ec2 as ec2,
 )
 
 from constructs import Construct
+
+
+def validate_dbt_client_cidr(value):
+    """
+    Return the developer CIDR allowed to reach Redshift on port 5439.
+
+    It must be an IPv4 range of /24 or narrower, so a typo can never
+    open the warehouse to the whole internet.
+    """
+    if not value:
+        raise ValueError(
+            "Missing context 'dbt_client_cidr'. Pass your public IP with: "
+            "cdk deploy -c dbt_client_cidr=$(curl -s https://checkip.amazonaws.com)/32"
+        )
+    try:
+        network = ipaddress.ip_network(value, strict=True)
+    except ValueError as error:
+        raise ValueError(f"Invalid dbt_client_cidr {value!r}: {error}") from error
+    if network.version != 4 or network.prefixlen < 24:
+        raise ValueError(
+            f"dbt_client_cidr {value!r} is too wide. Use an IPv4 /24 or narrower, "
+            "ideally your own /32."
+        )
+    return str(network)
 
 # Resolved from this file, so the stack synthesizes from any working directory.
 LAMBDA_PACKAGE_DIR = Path(__file__).resolve().parents[2] / "lambda_package"
@@ -685,12 +713,6 @@ class InfraStack(Stack):
             errors=["States.ALL"],
             result_path="$.ingestion_error",
         )
-
-
-
-
-        
-
         # ------------------------------------------------------------
         # P3.7 — Conditional Silver job
         # ------------------------------------------------------------
@@ -966,3 +988,146 @@ class InfraStack(Stack):
         schedule_delivery_alarm.add_alarm_action(
             cw_actions.SnsAction(alert_topic)
         )
+
+        # Only this developer IP may reach the Redshift endpoint (dbt).
+        dbt_client_cidr = validate_dbt_client_cidr(
+            self.node.try_get_context("dbt_client_cidr")
+        )
+
+        # Small dedicated VPC for the warehouse. Public subnets only and
+        # no NAT gateway, so it costs nothing by itself. Redshift Serverless
+        # needs subnets in three Availability Zones.
+        warehouse_vpc = ec2.CfnVPC(
+            self,
+            "WarehouseVpc",
+            cidr_block="10.20.0.0/16",
+            enable_dns_support=True,
+            enable_dns_hostnames=True,
+        )
+
+        warehouse_internet_gateway = ec2.CfnInternetGateway(
+            self,
+            "WarehouseInternetGateway",
+        )
+
+        warehouse_gateway_attachment = ec2.CfnVPCGatewayAttachment(
+            self,
+            "WarehouseGatewayAttachment",
+            vpc_id=warehouse_vpc.ref,
+            internet_gateway_id=warehouse_internet_gateway.ref,
+        )
+
+        warehouse_route_table = ec2.CfnRouteTable(
+            self,
+            "WarehousePublicRouteTable",
+            vpc_id=warehouse_vpc.ref,
+        )
+
+        warehouse_internet_route = ec2.CfnRoute(
+            self,
+            "WarehouseInternetRoute",
+            route_table_id=warehouse_route_table.ref,
+            destination_cidr_block="0.0.0.0/0",
+            gateway_id=warehouse_internet_gateway.ref,
+        )
+        warehouse_internet_route.add_dependency(warehouse_gateway_attachment)
+
+        # Keep S3 traffic (Spectrum reads of Silver) on the AWS network.
+        ec2.CfnVPCEndpoint(
+            self,
+            "WarehouseS3Endpoint",
+            vpc_id=warehouse_vpc.ref,
+            service_name=f"com.amazonaws.{self.region}.s3",
+            vpc_endpoint_type="Gateway",
+            route_table_ids=[warehouse_route_table.ref],
+        )
+
+        warehouse_subnets = []
+        for index in range(3):
+            subnet = ec2.CfnSubnet(
+                self,
+                f"WarehouseSubnet{index + 1}",
+                vpc_id=warehouse_vpc.ref,
+                cidr_block=f"10.20.{index}.0/24",
+                availability_zone=Fn.select(index, Fn.get_azs()),
+                map_public_ip_on_launch=False,
+            )
+            ec2.CfnSubnetRouteTableAssociation(
+                self,
+                f"WarehouseSubnet{index + 1}RouteTable",
+                subnet_id=subnet.ref,
+                route_table_id=warehouse_route_table.ref,
+            )
+            warehouse_subnets.append(subnet)
+
+        warehouse_security_group = ec2.CfnSecurityGroup(
+            self,
+            "WarehouseSecurityGroup",
+            group_description="Redshift Serverless: port 5439 from the dbt developer IP only",
+            vpc_id=warehouse_vpc.ref,
+            security_group_ingress=[
+                ec2.CfnSecurityGroup.IngressProperty(
+                    ip_protocol="tcp",
+                    from_port=5439,
+                    to_port=5439,
+                    cidr_ip=dbt_client_cidr,
+                    description="dbt from developer IP",
+                )
+            ],
+        )
+
+        # IAM role used by Redshift to read Silver data
+        redshift_role = iam.Role(
+            self,
+            "RedshiftSpectrumRole",
+            assumed_by=iam.ServicePrincipal("redshift.amazonaws.com"),
+        )
+
+        # Allow Redshift to read Silver S3 objects
+        silver_bucket.grant_read(redshift_role)
+
+        # Allow Redshift to read Glue Catalog metadata
+        redshift_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "glue:GetDatabase",
+                    "glue:GetDatabases",
+                    "glue:GetTable",
+                    "glue:GetTables",
+                    "glue:GetPartition",
+                    "glue:GetPartitions",
+                ],
+                resources=[
+                    f"arn:aws:glue:{self.region}:{self.account}:catalog",
+                    f"arn:aws:glue:{self.region}:{self.account}:database/nyc_collision_lakehouse",
+                    f"arn:aws:glue:{self.region}:{self.account}:table/nyc_collision_lakehouse/*",
+                ],
+            )
+        )
+
+        # Create the Redshift namespace
+        redshift_namespace = redshiftserverless.CfnNamespace(
+            self,
+            "CollisionWarehouseNamespace",
+            namespace_name="nyc-collision-warehouse",
+            db_name="collision_analytics",
+            iam_roles=[redshift_role.role_arn],
+        )
+
+        # Create the Redshift workgroup
+        redshift_workgroup = redshiftserverless.CfnWorkgroup(
+            self,
+            "CollisionWarehouseWorkgroup",
+            workgroup_name="nyc-collision-workgroup",
+            namespace_name=redshift_namespace.namespace_name,
+            base_capacity=4,
+            # Reachable from the internet, but the security group only
+            # admits dbt_client_cidr on port 5439.
+            publicly_accessible=True,
+            subnet_ids=[subnet.ref for subnet in warehouse_subnets],
+            security_group_ids=[warehouse_security_group.attr_group_id],
+        )
+
+        redshift_workgroup.add_dependency(redshift_namespace)
+        # The public endpoint needs the internet route in place first.
+        redshift_workgroup.add_dependency(warehouse_internet_route)
