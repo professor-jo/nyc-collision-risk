@@ -1,0 +1,18 @@
+
+version: 2
+
+models:
+  - name: stg_collisions
+    description: "Staging view of NYC collision records from the Silver Iceberg table."
+
+    columns:
+      - name: collision_id
+        description: "Unique identifier for each collision."
+        data_tests:
+          - not_null
+          - unique
+
+      - name: crash_date
+        description: "Date when the collision occurred."
+        data_tests:
+          - not_null

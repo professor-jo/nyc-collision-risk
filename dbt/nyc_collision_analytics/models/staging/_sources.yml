@@ -1,0 +1,16 @@
+version: 2
+
+sources:
+  - name: silver
+    description: "Silver layer, read through the Redshift Spectrum external schema silver (Glue database nyc_collision_lakehouse)."
+    schema: silver
+
+    tables:
+      - name: silver_collisions
+        description: "Validated and deduplicated NYC collision records, written to Iceberg by the Silver Glue job."
+        columns:
+          - name: collision_id
+            description: "NYC Open Data collision identifier (32-character hex string)."
+            data_tests:
+              - not_null
+              - unique
