@@ -30,3 +30,5 @@ response.json
 # IDE
 .vscode/
 .idea/
+# dbt run logs
+dbt/logs/
