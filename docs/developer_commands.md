@@ -69,7 +69,13 @@ cdk deploy -c budget_email=you@example.com -c dbt_client_cidr=$(curl -s https://
 
 `budget_email` is where AWS Budgets and alarm emails are sent. The stack refuses to build without it.
 
-`dbt_client_cidr` is the only address allowed to reach the Redshift endpoint on port 5439, so local dbt can connect. The command fills in your current public IP. The stack refuses to build without it, and rejects anything wider than a /24. When your IP changes, deploy again to update the security group.
+`dbt_client_cidr` lists the only addresses allowed to reach the Redshift endpoint on port 5439, so local dbt can connect. The command above fills in your current public IP. If you work from more than one network, pass them all, comma-separated (up to 5):
+
+```bash
+-c dbt_client_cidr="203.0.113.10/32,198.51.100.20/32"
+```
+
+The stack refuses to build without it, and rejects any entry wider than a /24. When one of your IPs changes, deploy again with the new list.
 
 ## 5. Run the Silver Glue job
 

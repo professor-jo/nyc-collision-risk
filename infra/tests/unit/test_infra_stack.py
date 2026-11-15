@@ -7,10 +7,10 @@ from aws_cdk.assertions import Match, Template
 from infra.infra_stack import InfraStack
 
 
-TEST_DBT_CLIENT_CIDR = "203.0.113.10/32"
+TEST_DBT_CLIENT_CIDRS = ["203.0.113.10/32", "198.51.100.20/32"]
 TEST_CONTEXT = {
     "budget_email": "test@example.com",
-    "dbt_client_cidr": TEST_DBT_CLIENT_CIDR,
+    "dbt_client_cidr": ", ".join(TEST_DBT_CLIENT_CIDRS),
 }
 
 
@@ -643,7 +643,7 @@ def test_redshift_port_is_open_only_to_the_dbt_client(template):
         assert rule.get("CidrIp") not in ("0.0.0.0/0", None)
         assert rule.get("CidrIpv6") is None
     assert [(r["FromPort"], r["ToPort"], r["CidrIp"]) for r in rules] == [
-        (5439, 5439, TEST_DBT_CLIENT_CIDR)
+        (5439, 5439, cidr) for cidr in TEST_DBT_CLIENT_CIDRS
     ]
 
 
@@ -661,7 +661,14 @@ def test_redshift_workgroup_is_public_in_three_subnets(template):
 
 @pytest.mark.parametrize(
     "cidr",
-    [None, "", "0.0.0.0/0", "10.0.0.0/8", "203.0.113.0/23", "::/0", "not-an-ip", "203.0.113.10/24"],
+    [
+        None, "", "0.0.0.0/0", "10.0.0.0/8", "203.0.113.0/23", "::/0",
+        "not-an-ip", "203.0.113.10/24",
+        # One bad entry rejects the whole list.
+        "203.0.113.10/32,0.0.0.0/0",
+        "203.0.113.10/32,",
+        ",".join(f"203.0.113.{n}/32" for n in range(6)),
+    ],
 )
 def test_stack_refuses_a_missing_or_wide_dbt_client_cidr(cidr):
     context = {"budget_email": "test@example.com"}
@@ -781,3 +788,21 @@ def test_usage_limit_custom_resource_can_only_manage_usage_limits(template):
         "Effect": "Allow",
         "Resource": "*",
     }]]
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("203.0.113.10/32", ["203.0.113.10/32"]),
+        (
+            "203.0.113.10/32, 198.51.100.20/32",
+            ["203.0.113.10/32", "198.51.100.20/32"],
+        ),
+        # Duplicates collapse to one rule.
+        ("203.0.113.10/32,203.0.113.10/32", ["203.0.113.10/32"]),
+    ],
+)
+def test_dbt_client_cidrs_accepts_one_or_more_networks(value, expected):
+    from infra.infra_stack import validate_dbt_client_cidrs
+
+    assert validate_dbt_client_cidrs(value) == expected

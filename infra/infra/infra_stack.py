@@ -47,28 +47,49 @@ from aws_cdk import (
 from constructs import Construct
 
 
-def validate_dbt_client_cidr(value):
-    """
-    Return the developer CIDR allowed to reach Redshift on port 5439.
+MAX_DBT_CLIENT_CIDRS = 5
 
-    It must be an IPv4 range of /24 or narrower, so a typo can never
-    open the warehouse to the whole internet.
+
+def validate_dbt_client_cidrs(value):
+    """
+    Return the developer CIDRs allowed to reach Redshift on port 5439.
+
+    Takes one CIDR or a comma-separated list, such as home and another
+    network. Each must be an IPv4 range of /24 or narrower, so a typo
+    can never open the warehouse to the whole internet.
     """
     if not value:
         raise ValueError(
             "Missing context 'dbt_client_cidr'. Pass your public IP with: "
             "cdk deploy -c dbt_client_cidr=$(curl -s https://checkip.amazonaws.com)/32"
         )
-    try:
-        network = ipaddress.ip_network(value, strict=True)
-    except ValueError as error:
-        raise ValueError(f"Invalid dbt_client_cidr {value!r}: {error}") from error
-    if network.version != 4 or network.prefixlen < 24:
+
+    entries = [entry.strip() for entry in str(value).split(",")]
+    if any(not entry for entry in entries):
+        raise ValueError(f"dbt_client_cidr {value!r} has an empty entry.")
+
+    networks = []
+    for entry in entries:
+        try:
+            network = ipaddress.ip_network(entry, strict=True)
+        except ValueError as error:
+            raise ValueError(
+                f"Invalid dbt_client_cidr entry {entry!r}: {error}"
+            ) from error
+        if network.version != 4 or network.prefixlen < 24:
+            raise ValueError(
+                f"dbt_client_cidr entry {entry!r} is too wide. Use an IPv4 /24 "
+                "or narrower, ideally your own /32."
+            )
+        if str(network) not in networks:
+            networks.append(str(network))
+
+    if len(networks) > MAX_DBT_CLIENT_CIDRS:
         raise ValueError(
-            f"dbt_client_cidr {value!r} is too wide. Use an IPv4 /24 or narrower, "
-            "ideally your own /32."
+            f"dbt_client_cidr lists {len(networks)} ranges; the limit is "
+            f"{MAX_DBT_CLIENT_CIDRS}. Remove networks you no longer use."
         )
-    return str(network)
+    return networks
 
 # Redshift Serverless compute ceiling for development. At 4 RPU this is
 # about 2.5 hours of query time a month (roughly $3.75 in us-east-1).
@@ -996,7 +1017,7 @@ class InfraStack(Stack):
         )
 
         # Only this developer IP may reach the Redshift endpoint (dbt).
-        dbt_client_cidr = validate_dbt_client_cidr(
+        dbt_client_cidrs = validate_dbt_client_cidrs(
             self.node.try_get_context("dbt_client_cidr")
         )
 
@@ -1061,14 +1082,16 @@ class InfraStack(Stack):
             "WarehouseSecurityGroup",
             group_description="Redshift Serverless: port 5439 from the dbt developer IP only",
             vpc_id=warehouse_vpc.ref,
+            # One rule per developer network.
             security_group_ingress=[
                 ec2.CfnSecurityGroup.IngressProperty(
                     ip_protocol="tcp",
                     from_port=5439,
                     to_port=5439,
-                    cidr_ip=dbt_client_cidr,
+                    cidr_ip=cidr,
                     description="dbt from developer IP",
                 )
+                for cidr in dbt_client_cidrs
             ],
         )
 
@@ -1126,7 +1149,7 @@ class InfraStack(Stack):
             # Stops a single heavy query from scaling past the base size.
             max_capacity=WAREHOUSE_BASE_RPU,
             # Reachable from the internet, but the security group only
-            # admits dbt_client_cidr on port 5439.
+            # admits the dbt_client_cidr ranges on port 5439.
             publicly_accessible=True,
             subnet_ids=[subnet.ref for subnet in warehouse_subnets],
             security_group_ids=[warehouse_security_group.attr_group_id],
