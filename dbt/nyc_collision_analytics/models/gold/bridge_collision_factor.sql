@@ -1,6 +1,26 @@
-
--- Gold bridge: collision-to-contributing-factor relationships
--- Grain: one row per unique collision and normalized factor
+-- Gold bridge: bridge_collision_factor
+--
+-- What it is:
+--   The link between collisions and their contributing factors. A
+--   collision can involve up to five vehicles, each with its own factor,
+--   so collisions and factors are many-to-many. This table resolves that,
+--   so fact_collision can be joined to dim_factor without duplicating
+--   collision rows by accident.
+--
+-- Grain: one row per collision and distinct contributing factor.
+--
+-- Keys:
+--   - collision_id: joins to fact_collision.
+--   - factor_key: MD5 of the lower-cased, trimmed factor name; joins to
+--     dim_factor.
+--
+-- Notes:
+--   - If two vehicles in the same collision have the same factor, it is
+--     listed once for that collision.
+--   - Empty and NULL factors are dropped.
+--   - The inner joins keep only rows whose collision exists in
+--     fact_collision and whose factor exists in dim_factor, so every row
+--     joins cleanly in both directions.
 
 WITH all_factors AS (
 
