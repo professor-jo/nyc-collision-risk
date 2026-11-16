@@ -1,0 +1,68 @@
+
+version: 2
+
+models:
+  - name: fact_collision
+    description: "One row per NYC collision."
+    columns:
+      - name: collision_id
+        data_tests:
+          - not_null
+          - unique
+
+      - name: time_key
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('dim_time')
+                field: time_key
+
+      - name: location_key
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('dim_location')
+                field: location_key
+
+  - name: dim_time
+    description: "One row per unique crash date and hour."
+    columns:
+      - name: time_key
+        data_tests:
+          - not_null
+          - unique
+
+  - name: dim_location
+    description: "One row per H3 resolution 9 geographic cell."
+    columns:
+      - name: location_key
+        data_tests:
+          - not_null
+          - unique
+
+  - name: dim_factor
+    description: "Distinct contributing factors."
+    columns:
+      - name: factor_key
+        data_tests:
+          - not_null
+          - unique
+
+  - name: bridge_collision_factor
+    description: "Unique collision-to-factor relationships."
+    columns:
+      - name: collision_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('fact_collision')
+                field: collision_id
+
+      - name: factor_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_factor')
+                field: factor_key
