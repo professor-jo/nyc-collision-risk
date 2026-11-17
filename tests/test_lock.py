@@ -1,3 +1,9 @@
+'''
+Tests for the DynamoDB ingestion lock in ingestion/lock.py, with
+DynamoDB mocked: taking a free lock, being refused when it's held,
+releasing it as the owner, ignoring a release by the wrong owner, and
+taking over a lock that has expired.
+'''
 
 from unittest.mock import MagicMock, patch
 

@@ -1,3 +1,10 @@
+'''
+This script checks the S3 Bronze bucket for duplicate collision records.
+
+It counts how many times each collision_id appears and how many of those
+repeats have different contents (updated versions of the same crash).
+This showed that Silver needs to deduplicate and keep the latest version.
+'''
 
 import json
 from collections import Counter, defaultdict

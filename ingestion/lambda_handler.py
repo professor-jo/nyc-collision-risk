@@ -1,3 +1,12 @@
+'''
+This is the AWS Lambda entry point for ingestion, called by Step Functions.
+
+It takes the ingestion lock, then either runs a backfill for a given date
+range or runs normal incremental ingestion followed by the 14-day lookback
+for late records. It returns whether ingestion caught up and whether Bronze
+changed, which Step Functions uses to decide whether to run Silver. The
+lock is always released, even when something fails.
+'''
 
 from ingestion.config import MAX_INGESTION_ATTEMPTS
 from ingestion.ingest_collisions import main

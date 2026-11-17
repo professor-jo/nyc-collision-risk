@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+'''
+Entry point for the AWS CDK app. It creates the InfraStack, which holds
+all of the project's AWS resources, and synthesizes it into a
+CloudFormation template that `cdk deploy` uses.
+'''
 import os
 
 import aws_cdk as cdk

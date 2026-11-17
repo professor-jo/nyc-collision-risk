@@ -1,5 +1,10 @@
+'''
+Shared settings for the collision ingestion pipeline: the NYC Open Data
+API endpoint, batch size, time limits, the lookback window for late
+records and how many attempts a run gets to catch up.
+'''
 
-API_URL = "https://data.cityofnewyork.us/resource/h9gi-nx95.json"
+API_URL ="https://data.cityofnewyork.us/resource/h9gi-nx95.json"
 
 # Number of records requested per API call.
 BATCH_SIZE = 100

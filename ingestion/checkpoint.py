@@ -1,3 +1,12 @@
+'''
+This script reads and writes the ingestion checkpoint (watermark) in S3.
+
+The checkpoint records the last processed (crash_date, collision_id), so
+each run resumes where the previous one stopped. If the checkpoint is
+missing, ingestion stops with an error instead of starting over. Running
+this file directly creates the first checkpoint for a new environment.
+'''
+
 import json
 import os
 

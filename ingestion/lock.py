@@ -1,3 +1,12 @@
+'''
+This script manages a lock in DynamoDB so only one ingestion run can
+write to Bronze at a time.
+
+acquire_lock() takes the lock unless another run holds an unexpired one,
+and release_lock() frees it only if this run still owns it. A lock
+expires after 10 minutes, so a crashed run can't block ingestion forever.
+'''
+
 import os
 import time
 import uuid

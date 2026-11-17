@@ -1,3 +1,10 @@
+'''
+This script profiles the raw collision data in the S3 Bronze bucket.
+
+It reads every JSON file under collisions/ and, for each field, reports
+how often it's missing and which data types appear. It was used to
+design the Silver table's schema and cleaning rules.
+'''
 
 import json
 from collections import Counter

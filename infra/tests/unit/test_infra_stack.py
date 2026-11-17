@@ -1,3 +1,13 @@
+'''
+Unit tests for the CDK InfraStack. They synthesize the stack into a
+CloudFormation template and check it without deploying anything.
+
+They cover the S3 data lake buckets (security, versioning, lifecycle),
+the cost budget, the Step Functions pipeline (lock handling, Silver gate,
+replay and backfill), CloudWatch alarms, the EventBridge schedule, and
+the Redshift Serverless warehouse (network access and usage limits).
+'''
+
 import json
 
 import aws_cdk as cdk
