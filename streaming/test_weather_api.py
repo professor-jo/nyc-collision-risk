@@ -1,10 +1,17 @@
 '''
-This script fetches the current weather for Manhattan from the free
-Open-Meteo API (no API key needed) and prints it to the console.
+This script tests the weather side of the streaming pipeline using the
+free Open-Meteo API (no API key needed).
 
-It requests temperature, precipitation, rain, wind speed and the weather
-code, then prints the raw JSON observation and the units each value is
-measured in, so we can check the data structure before using it.
+1. Fetches the current weather for Manhattan: temperature, precipitation,
+   rain, wind speed and the weather code.
+2. Prints the raw observation and the units of each value, so we can
+   inspect the data structure.
+3. Converts the response into a standard event with normalize_weather()
+   and prints it.
+4. Checks the event's structure with asserts, and that normalizing the
+   same observation twice gives the same event_id.
+
+It makes no changes to AWS and incurs no AWS charges.
 '''
 
 import json
@@ -12,6 +19,7 @@ from urllib.parse import urlencode
 from urllib.request import urlopen
 
 from normalize_weather import normalize_weather
+from event_contract import validate_event
 
 BASE_URL = "https://api.open-meteo.com/v1/forecast"
 
@@ -53,6 +61,8 @@ assert event["source"] == "open_meteo"
 assert event["event_id"]
 assert event["observed_at"].endswith("Z")
 assert event["measurements"]["temperature_c"] is not None
+assert validate_event(event)
+
 
 # The same observation should produce the same event ID
 event_again = normalize_weather(data)

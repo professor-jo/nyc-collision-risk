@@ -1,14 +1,22 @@
 '''
-1. Connects to NYC open data's traffic speed API
-2. Requests five records ordered by the latest data_as_of timestamp
-3. Prints records so we can inspect structures
-4. Makes no changes to AWS and incurs no AWS charges
+This script tests the traffic side of the streaming pipeline using NYC
+Open Data's real-time traffic speed API (NYC DOT).
+
+1. Requests the five most recent records, ordered by data_as_of.
+2. Prints the raw records, so we can inspect the data structure.
+3. Converts each record into a standard event with normalize_traffic()
+   and prints it.
+4. Checks each event's structure with asserts, and that normalizing the
+   same record twice gives the same event_id.
+
+It makes no changes to AWS and incurs no AWS charges.
 '''
 import json
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
 from normalize_traffic import normalize_traffic
+from event_contract import validate_event
 
 BASE_URL = (
     "https://data.cityofnewyork.us/"
@@ -46,6 +54,7 @@ for record in records:
     assert event["source"] == "nyc_dot"
     assert event["event_id"]
     assert event["observed_at"].endswith("Z")
+    assert validate_event(event)
 
     # Same observation = same deterministic ID
     event_again = normalize_traffic(record)

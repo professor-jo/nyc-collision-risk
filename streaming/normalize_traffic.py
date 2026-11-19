@@ -1,3 +1,18 @@
+'''
+This script turns one raw NYC DOT traffic speed record into a clean,
+standard traffic event that the streaming pipeline can use.
+
+It does three things:
+1. Converts data_as_of to a UTC timestamp. NYC DOT times have no time
+   zone, so they're treated as New York local time before converting.
+2. Builds a deterministic event_id by hashing the source, road link and
+   observation time, so the same reading always gets the same ID and
+   duplicates can be detected.
+3. Groups the fields into location (link_id, borough, link_points) and
+   measurements (speed_mph, travel_time_seconds), turns the numbers from
+   text into floats (or None when missing), and adds metadata such as the
+   event type, source and ingestion time.
+'''
 
 import hashlib
 from datetime import datetime, timezone

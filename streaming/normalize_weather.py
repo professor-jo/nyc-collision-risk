@@ -36,6 +36,7 @@ def normalize_weather(raw_data):
         event_identity.encode("utf-8")
     ).hexdigest()
 
+
     return {
         "event_id": event_id,
         "event_type": "weather",
